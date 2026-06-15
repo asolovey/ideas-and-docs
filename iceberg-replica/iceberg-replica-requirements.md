@@ -93,7 +93,7 @@ Standard Iceberg JDBC catalog tables (pre-existing, unmodified):
 New objects added by the SQL initialization script (Section 5):
 - `iceberg_metadata_history` table: one row per `metadata_location` change per table,
   with a monotonic sequence number and timestamp
-- Trigger on `iceberg_tables`: `AFTER INSERT OR UPDATE OF metadata_location` fires and
+- Trigger on `iceberg_tables`: `AFTER INSERT OR UPDATE OF metadata_location OR DELETE` fires and
   inserts a row into `iceberg_metadata_history`
 
 All tables above are replicated to the read-only replica via PostgreSQL replication.
@@ -121,6 +121,8 @@ Owned and managed exclusively by the replication service. Contains:
 - `metadata_version_jobs` — one row per (replica_id, `iceberg_metadata_history` entry);
   tracks the processing state of each metadata version
 - `file_rewrite_jobs` — distributed work queue; one row per file to be checked or rewritten
+- `metadata_version_file_deps` — maps file jobs to metadata versions and tracks current snapshot status
+- `file_job_children` — tracks parent-child relationships for file rewrites
 
 
 ## 5. Primary Catalog Enhancement
@@ -141,7 +143,7 @@ The script creates:
 | `catalog_name`     | TEXT        | Iceberg catalog name                            |
 | `table_namespace`  | TEXT        | Table namespace                                 |
 | `table_name`       | TEXT        | Table name                                      |
-| `metadata_location`| TEXT        | Absolute S3 path of the new metadata file       |
+| `metadata_location`| TEXT        | Absolute S3 path of the new metadata file (NULL for deletes) |
 | `sequence_no`      | BIGINT      | Monotonically increasing per (catalog, namespace, table) |
 | `recorded_at`      | TIMESTAMPTZ | Wall-clock time of the trigger firing (default NOW()) |
 
@@ -152,9 +154,10 @@ latest-first polling.
 
 ```sql
 CREATE TRIGGER iceberg_metadata_history_trigger
-AFTER INSERT OR UPDATE OF metadata_location ON iceberg_tables
+AFTER INSERT OR UPDATE OF metadata_location OR DELETE ON iceberg_tables
 FOR EACH ROW EXECUTE FUNCTION record_metadata_history();
 ```
+*Note: For `DELETE` operations (e.g., dropped tables), the trigger inserts a tombstone marker (`metadata_location = NULL`) into `iceberg_metadata_history` to instruct the replica to drop the table from its writable catalog.*
 
 **Retention:** Rows older than 7 days are eligible for deletion. Cleanup is implemented
 as a periodic DELETE (via `pg_cron` or a scheduled DBA job) and is not managed by the
@@ -218,7 +221,8 @@ command-line arguments and configuration file:
 | `replicated_s3_prefix`      | TEXT        | S3 URL prefix of the replicated location (substitution destination for position delete `_path` values; source for all `HeadObject` checks) |
 | `write_metadata_path`       | TEXT        | Destination S3 prefix for rewritten metadata, manifest list, and manifest files |
 | `write_data_path`           | TEXT        | Destination S3 prefix for rewritten position delete files          |
-| `max_retry_attempts`        | INT         | Maximum `HeadObject` retry attempts before `PERMANENTLY_FAILED` (default: 20) |
+| `s3_replication_sla_seconds`| INT         | Expected maximum S3 replication lag in seconds; used for calculating PERMANENTLY_FAILED thresholds (default: 900) |
+| `max_retry_attempts`        | INT         | Maximum S3 check retry attempts before `PERMANENTLY_FAILED` (default: 20) |
 | `retry_initial_interval_ms` | INT         | Initial exponential backoff interval in milliseconds (default: 30 000) |
 | `retry_max_interval_ms`     | INT         | Backoff interval cap in milliseconds (default: 600 000)            |
 | `lease_timeout_seconds`     | INT         | Seconds before an abandoned claimed job is eligible for re-claim (default: 300) |
@@ -262,7 +266,7 @@ the lifecycle of each metadata version from discovery through to catalog applica
 **Status transitions:**
 
 ```
-PENDING     — metadata file job enqueued; HeadObject not yet succeeded
+PENDING     — metadata file job enqueued; S3 check not yet succeeded
 IN_PROGRESS — metadata file available; child file jobs enqueued; awaiting completion
 APPLIED     — all critical-path file jobs resolved; version written to iceberg_tables
 SUPERSEDED  — a newer version reached APPLIED first; remaining jobs marked SUPERSEDED
@@ -312,6 +316,18 @@ CREATE INDEX idx_mvfd_job
     ON metadata_version_file_deps (file_job_id);
 ```
 
+#### `file_job_children` Table
+
+Created by this script to record direct parent-to-child relationships for dependency cascading.
+
+```sql
+CREATE TABLE file_job_children (
+    parent_job_id BIGINT NOT NULL,
+    child_job_id  BIGINT NOT NULL,
+    PRIMARY KEY (parent_job_id, child_job_id)
+);
+```
+
 #### `metadata_version_jobs` Indexes
 
 ```sql
@@ -337,17 +353,17 @@ functions in a continuous loop across all tables in the catalog:
    row (status: PENDING) and immediately enqueue a `file_rewrite_jobs` entry of type METADATA
    for the metadata file. The metadata file path is known directly from
    `iceberg_metadata_history.metadata_location` — no S3 listing or scanning is required.
+   *(Note: If `metadata_location` is NULL, indicating a dropped table, drop it from the replica catalog.)*
 2. **File processing:** Worker threads claim and process `file_rewrite_jobs` via
    `SELECT ... FOR UPDATE SKIP LOCKED`. All file types are checked for S3 availability
-   using `HeadObject` and rewritten using the same job lifecycle (Section 7.4). All
+   using `S3FileIO` and rewritten using the same job lifecycle (Section 7.4). All
    intermediate job types (METADATA, MANIFEST_LIST, MANIFEST) additionally perform
    one-level child discovery after rewriting, creating child jobs before marking
    themselves DONE (Section 7.5).
 3. **Catalog advancement:** A metadata version is considered **complete** when every row
    in `metadata_version_file_deps` for that version has a corresponding `file_rewrite_jobs`
    entry in a terminal state (DONE, PERMANENTLY_FAILED, or SUPERSEDED), subject to the
-   constraint that no entry on the current snapshot's critical dependency path (position
-   deletes → manifests → manifest list → metadata file) may be PERMANENTLY_FAILED (see
+   constraint that no entry on the current snapshot's critical dependency path (where `is_current_snapshot = true`) may be PERMANENTLY_FAILED (see
    Section 8.6).
 
    **Why the deps table is always fully populated before completion can succeed:** This
@@ -478,10 +494,11 @@ underlying job already existed.
 Junction table recording which file jobs each metadata version depends on. This is the
 basis for both completion detection (Section 6.1 step 3) and SUPERSEDED propagation.
 
-| Column                | Type   | Description                              |
-|-----------------------|--------|------------------------------------------|
-| `metadata_version_id` | BIGINT | FK to `metadata_version_jobs.id`         |
-| `file_job_id`         | BIGINT | FK to `file_rewrite_jobs.id`             |
+| Column                | Type    | Description                              |
+|-----------------------|---------|------------------------------------------|
+| `metadata_version_id` | BIGINT  | FK to `metadata_version_jobs.id`         |
+| `file_job_id`         | BIGINT  | FK to `file_rewrite_jobs.id`             |
+| `is_current_snapshot` | BOOLEAN | True if this file belongs to the version's current snapshot |
 
 ```sql
 PRIMARY KEY (metadata_version_id, file_job_id)
@@ -567,7 +584,7 @@ LIMIT ?
 
 ### 7.5 File Availability and Retry
 
-S3 `HeadObject` is the **sole mechanism** for checking file availability, applied
+`S3FileIO` is the **sole mechanism** for checking file availability, applied
 uniformly to all file types: METADATA, MANIFEST_LIST, MANIFEST, and POSITION_DELETE.
 No S3 listing, scanning, or type-specific polling is performed. The `iceberg_metadata_history`
 table (PostgreSQL) is the only polling target; metadata file paths come directly from it,
@@ -576,20 +593,15 @@ processed.
 
 For each claimed job:
 
-1. Issue S3 `HeadObject` against the **replicated** S3 location (`source_path`). On 404,
-   go to step 5.
-2. **All job types — rewrite:** fetch the file from the replicated S3 location and rewrite
-   it applying deterministic path substitution (Section 8). Write the rewritten file to
-   `dest_path` (skip the write if `dest_path` already exists in S3 — idempotent; see
-   Section 7.6). The file content is now parsed and held in memory; it is reused for child
-   discovery in step 3 without a second S3 read.
-3. **METADATA, MANIFEST_LIST, and MANIFEST jobs only — child discovery:** discover direct
-   child file paths from the already-parsed source file content. Discovery is **one level
-   deep only**:
+1. Issue an existence check against the **replicated** S3 location (`source_path`) using `S3FileIO`'s `newInputFile(path).exists()`. On `false`, go to step 5.
+2. **All job types — rewrite:** Fetch the file from the replicated S3 location (using `S3FileIO`) and rewrite it applying deterministic path substitution (Section 8).
+   * *Exception for Manifests:* If the file is a manifest containing position deletes that are not yet `DONE`, defer the job via `next_attempt_at` and skip the write phase.
+   * Write the rewritten file to `dest_path`. To ensure idempotency, first check if `dest_path` already exists using `S3FileIO`'s `newInputFile(dest_path).exists()`. If it does, skip the write. The file content is now parsed and held in memory; it is reused for child discovery in step 3 without a second S3 read.
+3. **METADATA, MANIFEST_LIST, and MANIFEST jobs only — child discovery:** Discover direct child file paths from the already-parsed source file content. Discovery is **one level deep only**, and cascades completion dependencies naturally:
 
-   - **METADATA jobs:** collect manifest list paths from the metadata file
-   - **MANIFEST_LIST jobs:** collect manifest paths from the manifest list
-   - **MANIFEST jobs:** collect position delete file paths from the manifest
+   - **METADATA jobs:** collect manifest list paths from the metadata file. Identify the `current-snapshot-id` to pass the `is_current_snapshot = true` flag down to its dependencies.
+   - **MANIFEST_LIST jobs:** collect manifest paths from the manifest list. Inherit the `is_current_snapshot` flag from the parent.
+   - **MANIFEST jobs:** collect position delete file paths from the manifest. Inherit the `is_current_snapshot` flag from the parent.
      (data files and equality delete files require no jobs and are not enqueued)
    - **POSITION_DELETE jobs:** no children; skip to step 4
 
@@ -609,8 +621,8 @@ For each claimed job:
    **c.** Insert a dep row for every non-terminal metadata version that references
    the current (parent) job:
    ```sql
-   INSERT INTO metadata_version_file_deps(metadata_version_id, file_job_id)
-   SELECT mvfd.metadata_version_id, :child_job_id
+   INSERT INTO metadata_version_file_deps(metadata_version_id, file_job_id, is_current_snapshot)
+   SELECT mvfd.metadata_version_id, :child_job_id, :is_current_snapshot
    FROM   metadata_version_file_deps mvfd
    JOIN   metadata_version_jobs mvj ON mvj.id = mvfd.metadata_version_id
    WHERE  mvfd.file_job_id = :parent_job_id
@@ -628,8 +640,8 @@ For each claimed job:
        SELECT fjc.child_job_id FROM file_job_children fjc
        JOIN   descendants d ON fjc.parent_job_id = d.child_job_id
    )
-   INSERT INTO metadata_version_file_deps(metadata_version_id, file_job_id)
-   SELECT mvfd.metadata_version_id, d.child_job_id
+   INSERT INTO metadata_version_file_deps(metadata_version_id, file_job_id, is_current_snapshot)
+   SELECT mvfd.metadata_version_id, d.child_job_id, :is_current_snapshot
    FROM   descendants d
    CROSS JOIN (
        SELECT metadata_version_id FROM metadata_version_file_deps
@@ -640,7 +652,7 @@ For each claimed job:
 
    **Crash safety:** if the worker crashes after writing `dest_path` (step 2) but before
    completing child discovery (step 3), the job remains CLAIMED; its lease expires and
-   another worker re-runs from step 1. The `HeadObject` on `dest_path` in step 2 detects
+   another worker re-runs from step 1. The existence check on `dest_path` in step 2 detects
    the already-written file and skips the write. The `ON CONFLICT DO NOTHING` clauses on
    all three tables in step 3 make re-running discovery idempotent.
 
@@ -652,12 +664,12 @@ For each claimed job:
    - Increment `attempts`; compute `next_attempt_at` using exponential backoff
      (initial interval: 30 seconds; multiplier: 2; cap: 10 minutes)
    - After exceeding configurable maximum attempts (default: 20) **or** when
-     `(NOW() - job creation time) > 2 × maximum S3 replication SLA`: set status to
+     `(NOW() - job creation time) > 2 × replica_config.s3_replication_sla_seconds`: set status to
      `PERMANENTLY_FAILED` and record `last_error` for operator inspection
    - Rationale: time-based heuristic is the only viable approach given that primary S3
      is not accessible from the replica service
 
-### 7.5 Idempotency
+### 7.6 Idempotency
 
 Idempotency of file rewrites is required in **two distinct scenarios**, not just crash
 recovery:
@@ -674,7 +686,7 @@ recovery:
 
 In both cases, the mechanism is identical: `dest_path` is derived deterministically from
 `source_path` by prefix substitution (preserving relative path structure). Before writing,
-the service checks whether `dest_path` already exists in S3 via `HeadObject`. If so, the
+the service checks whether `dest_path` already exists in S3. If so, the
 write is skipped and the job is marked DONE immediately. Since the substitution is
 deterministic and the source content is immutable (S3 replication does not modify file
 content), both scenarios produce the same result whether the write happens once or is
@@ -730,34 +742,21 @@ substitution based on file type:
 - Position delete entries: substitute primary prefix → `write.data.path` prefix
 - Equality delete entries: substitute primary prefix → replicated prefix
 
-### 8.5 Rewriting Dependency Order
+### 8.5 Rewriting Dependency Order and File Sizes
 
-Within a metadata version, rewrites must respect the following dependency chain (leaves
-first):
+Path substitution for all file types is deterministic. Therefore, the physical destination paths (`dest_path`) can be calculated in-memory without waiting for child files to actually be written to S3. 
 
-1. **Position delete files** (no dependencies; content rewrite)
-2. **Manifest files** (depend on rewritten position delete files and in-place data files)
-3. **Manifest list files** (depend on rewritten manifests)
-4. **Metadata files** (depend on rewritten manifest lists)
+However, Iceberg manifest files strictly record the physical byte size (`file_size_in_bytes`) of the files they reference. Because rewriting a Parquet position delete file modifies its content (changing the `_path` values), its final byte size will change. To maintain strict Iceberg specification compliance, a manifest file cannot be rewritten until the new byte sizes of its referenced position delete files are known.
 
-A manifest file job must not begin rewriting until all position delete file jobs it
-references are in DONE status. Since position delete and manifest jobs may be shared across
-metadata versions (via `metadata_version_file_deps`), this check is performed at rewrite
-time: when a worker claims a manifest job, it fetches the manifest file, identifies all
-position delete `source_path` values it references, looks up their `file_rewrite_jobs`
-rows, and defers (releases the claim with a short `next_attempt_at`) if any are not yet
-DONE. The `dest_path` values of the DONE position delete jobs are then used directly when
-writing the manifest's rewritten content. No separate dependency-tracking table is required;
-the check is a targeted query against `file_rewrite_jobs` by `source_path` at rewrite time.
+To optimize throughput, manifest file processing is strictly conditional based on its actual contents:
 
-**Distinction from completion tracking:** this rewrite-time check is a dependency ordering
-mechanism whose sole purpose is ensuring rewritten manifests embed the correct `dest_path`
-values for their position delete entries. It is entirely separate from the
-`metadata_version_file_deps` completion tracking described in Section 6.1 step 3. Position
-delete paths — and all other file paths in the dependency tree — are entered into
-`metadata_version_file_deps` exclusively by the METADATA job's deep traversal (Section 7.4),
-not by manifest or manifest list jobs. Manifest jobs have no role in deps table population
-and no effect on version completion tracking; they only enforce rewrite ordering.
+1. **Manifests without position deletes (Optimization Path):** The vast majority of manifests only contain data files or equality delete files (which are not rewritten). These manifest jobs can be processed immediately and asynchronously. The worker applies path substitutions in-memory, writes the new manifest to `write.metadata.path`, and marks the job `DONE` without waiting on any other jobs.
+2. **Manifests with position deletes (Dependency Path):** When a worker claims a manifest job and discovers it contains position delete entries, it must ensure those specific files are fully rewritten to capture their new file sizes.
+    * The worker identifies the referenced position delete `source_path` values and queries `file_rewrite_jobs`.
+    * **If all referenced position delete jobs are `DONE`:** The worker fetches their new file sizes (via `S3FileIO`), applies the deterministic path substitutions, writes the new manifest, and marks the job `DONE`.
+    * **If any referenced position delete jobs are not `DONE`:** The worker aborts the rewrite, releases the claim, and defers the job by updating `next_attempt_at` with a short delay.
+
+This ensures that the dependency bottleneck is only incurred when absolutely necessary, allowing parallel processing for the rest of the metadata tree. No separate dependency-tracking table is required for this phase; the check is a targeted query against `file_rewrite_jobs` at rewrite time.
 
 ### 8.6 Expired Snapshots
 
