@@ -221,8 +221,9 @@ command-line arguments and configuration file:
 | `replicated_s3_prefix`      | TEXT        | S3 URL prefix of the replicated location (substitution destination for position delete `_path` values; source for all `HeadObject` checks) |
 | `write_metadata_path`       | TEXT        | Destination S3 prefix for rewritten metadata, manifest list, and manifest files |
 | `write_data_path`           | TEXT        | Destination S3 prefix for rewritten position delete files          |
-| `s3_replication_sla_seconds`| INT         | Expected maximum S3 replication lag in seconds; used for calculating PERMANENTLY_FAILED thresholds (default: 900) |
-| `max_retry_attempts`        | INT         | Maximum S3 check retry attempts before `PERMANENTLY_FAILED` (default: 20) |
+| `s3_replication_sla_seconds`| INT         | Expected maximum S3 replication lag in seconds (default: 900); used as an operational reference only — not directly used in the `PERMANENTLY_FAILED` condition |
+| `max_retry_attempts`        | INT         | Maximum S3 check retry attempts (404 responses only) before `PERMANENTLY_FAILED` (default: 20). Manifest deferrals due to pending position deletes do **not** increment this counter |
+| `permanently_failed_timeout_seconds` | INT | Wall-clock timeout after which a job is marked `PERMANENTLY_FAILED` regardless of attempt count (default: 14 400 — 4 hours). Acts as a safety net for anomalous cases; `max_retry_attempts` is the intended primary trigger. Default chosen to exceed total retry-exhaustion time: with defaults (20 attempts, 30 s initial backoff, 2× multiplier, 10 min cap) exhaustion takes ~165 minutes |
 | `retry_initial_interval_ms` | INT         | Initial exponential backoff interval in milliseconds (default: 30 000) |
 | `retry_max_interval_ms`     | INT         | Backoff interval cap in milliseconds (default: 600 000)            |
 | `lease_timeout_seconds`     | INT         | Seconds before an abandoned claimed job is eligible for re-claim (default: 300) |
@@ -357,40 +358,41 @@ functions in a continuous loop across all tables in the catalog:
 2. **File processing:** Worker threads claim and process `file_rewrite_jobs` via
    `SELECT ... FOR UPDATE SKIP LOCKED`. All file types are checked for S3 availability
    using `S3FileIO` and rewritten using the same job lifecycle (Section 7.4). All
-   intermediate job types (METADATA, MANIFEST_LIST, MANIFEST) additionally perform
-   one-level child discovery after rewriting, creating child jobs before marking
-   themselves DONE (Section 7.5).
+   intermediate job types (METADATA, MANIFEST_LIST, MANIFEST) perform one-level child
+   discovery (Section 7.5 step 3) from the parsed file content before marking themselves
+   DONE. For MANIFEST jobs containing position deletes, child discovery always runs first;
+   if those position delete children are not yet `DONE`, the manifest job is deferred
+   (reset to `PENDING`) rather than written, and retried later.
 3. **Catalog advancement:** A metadata version is considered **complete** when every row
    in `metadata_version_file_deps` for that version has a corresponding `file_rewrite_jobs`
-   entry in a terminal state (DONE, PERMANENTLY_FAILED, or SUPERSEDED), subject to the
-   constraint that no entry on the current snapshot's critical dependency path (where `is_current_snapshot = true`) may be PERMANENTLY_FAILED (see
-   Section 8.6).
+   entry in a terminal state (`DONE`, `PERMANENTLY_FAILED`, or `SUPERSEDED`), subject to
+   the constraint that no entry on the current snapshot's critical dependency path
+   (where `is_current_snapshot = true`) may be `PERMANENTLY_FAILED` (see Section 8.6).
 
-   **Why the deps table is always fully populated before completion can succeed:** This
-   protection operates at every level of the discovery chain. Each intermediate job
-   (METADATA, MANIFEST_LIST, MANIFEST) is itself in `metadata_version_file_deps` as a
-   non-terminal row. The completion check counts non-terminal rows, so it cannot return
-   zero while any intermediate job is still PENDING or CLAIMED. Each intermediate job only
-   reaches DONE (Section 7.5 step 4) after inserting all its direct children into
-   `metadata_version_file_deps` (Section 7.5 step 3). Those children start as PENDING,
-   which prevents completion from triggering prematurely. The guarantee propagates
-   recursively: manifest list jobs (children of METADATA jobs) insert manifest deps before
-   reaching DONE; manifest jobs insert position delete deps before reaching DONE. At the
-   moment the last position delete job reaches DONE, the completion check finds all deps
-   terminal and the version is eligible for application.
-
-   **Detection:** after any worker transitions a job to a terminal state, it queries
-   `metadata_version_file_deps` to find all metadata versions that reference that job and
-   runs the completion check for each one. This is an O(versions per file) query, typically
-   small. A background sweep additionally re-evaluates all IN_PROGRESS `metadata_version_jobs`
-   rows periodically, as a safety net for workers that crash after marking a job terminal
-   but before completing the version check.
-
-   On completion, the version is applied to `iceberg_tables` only if its `sequence_no` is
-   greater than the currently-applied version's `sequence_no`. Older IN_PROGRESS versions
-   with lower `sequence_no` are then marked SUPERSEDED; their PENDING file jobs that are
-   exclusively referenced by SUPERSEDED versions (i.e., no non-SUPERSEDED version depends
-   on them via `metadata_version_file_deps`) are also marked SUPERSEDED.
+   - **Why the deps table is always fully populated before completion can succeed:** This
+     protection operates at every level of the discovery chain. Each intermediate job
+     (METADATA, MANIFEST_LIST, MANIFEST) is itself in `metadata_version_file_deps` as a
+     non-terminal row. The completion check counts non-terminal rows, so it cannot return
+     zero while any intermediate job is still `PENDING` or `CLAIMED`. Each intermediate job
+     only reaches `DONE` (Section 7.5 step 4) after inserting all its direct children into
+     `metadata_version_file_deps` (Section 7.5 step 3). Those children start as `PENDING`,
+     which prevents completion from triggering prematurely. The guarantee propagates
+     recursively: manifest list jobs insert manifest deps before reaching `DONE`; manifest
+     jobs insert position delete deps before reaching `DONE`. At the moment the last
+     position delete job reaches `DONE`, the completion check finds all deps terminal and
+     the version is eligible for application.
+   - **Detection:** after any worker transitions a job to a terminal state, it queries
+     `metadata_version_file_deps` to find all metadata versions that reference that job and
+     runs the completion check for each one. This is an O(versions per file) query,
+     typically small. A background sweep additionally re-evaluates all `IN_PROGRESS`
+     `metadata_version_jobs` rows periodically, as a safety net for workers that crash
+     after marking a job terminal but before completing the version check.
+   - **On completion:** the version is applied to `iceberg_tables` only if its
+     `sequence_no` is greater than the currently-applied version's `sequence_no`. Older
+     `IN_PROGRESS` versions with lower `sequence_no` are then marked `SUPERSEDED`; their
+     `PENDING` file jobs that are exclusively referenced by `SUPERSEDED` versions (i.e.,
+     no non-`SUPERSEDED` version depends on them via `metadata_version_file_deps`) are
+     also marked `SUPERSEDED`.
 4. **Lease recovery:** Reclaim `file_rewrite_jobs` whose `claimed_at` exceeds the
    configurable lease timeout (worker assumed crashed).
 
@@ -568,7 +570,9 @@ files from S3.
 ```
 PENDING → CLAIMED → DONE
                   → PERMANENTLY_FAILED
-         (timeout) → PENDING (re-claim)
+                  → PENDING (manifest deferred: position delete children not yet DONE;
+                             attempts counter unchanged; next_attempt_at set to short fixed delay)
+         (timeout) → PENDING (re-claim after lease expiry)
 PENDING → SUPERSEDED (no non-terminal version depends on this job)
 ```
 
@@ -594,18 +598,15 @@ processed.
 For each claimed job:
 
 1. Issue an existence check against the **replicated** S3 location (`source_path`) using `S3FileIO`'s `newInputFile(path).exists()`. On `false`, go to step 5.
-2. **All job types — rewrite:** Fetch the file from the replicated S3 location (using `S3FileIO`) and rewrite it applying deterministic path substitution (Section 8).
-   * *Exception for Manifests:* If the file is a manifest containing position deletes that are not yet `DONE`, defer the job via `next_attempt_at` and skip the write phase.
-   * Write the rewritten file to `dest_path`. To ensure idempotency, first check if `dest_path` already exists using `S3FileIO`'s `newInputFile(dest_path).exists()`. If it does, skip the write. The file content is now parsed and held in memory; it is reused for child discovery in step 3 without a second S3 read.
+2. **All job types — fetch and parse:** Fetch the file from the replicated S3 location using `S3FileIO` and parse it in memory. The parsed content is held and reused for both child discovery (step 3) and the rewrite (step 4) without a second S3 read.
 3. **METADATA, MANIFEST_LIST, and MANIFEST jobs only — child discovery:** Discover direct child file paths from the already-parsed source file content. Discovery is **one level deep only**, and cascades completion dependencies naturally:
 
-   - **METADATA jobs:** collect manifest list paths from the metadata file. Identify the `current-snapshot-id` to pass the `is_current_snapshot = true` flag down to its dependencies.
-   - **MANIFEST_LIST jobs:** collect manifest paths from the manifest list. Inherit the `is_current_snapshot` flag from the parent.
-   - **MANIFEST jobs:** collect position delete file paths from the manifest. Inherit the `is_current_snapshot` flag from the parent.
-     (data files and equality delete files require no jobs and are not enqueued)
-   - **POSITION_DELETE jobs:** no children; skip to step 4
+   - **METADATA jobs:** collect all manifest list paths from the metadata file. The manifest list whose snapshot-id matches `current-snapshot-id` is enqueued with `is_current_snapshot = true`; every other manifest list (historical snapshots) is enqueued with `is_current_snapshot = false`. Only the current snapshot's dependency chain is on the critical path for version application.
+   - **MANIFEST_LIST jobs:** collect manifest paths from the manifest list. Inherit the `is_current_snapshot` flag from the parent MANIFEST_LIST job.
+   - **MANIFEST jobs:** collect position delete file paths from the manifest. Inherit the `is_current_snapshot` flag from the parent. (Data files and equality delete files require no jobs and are not enqueued.) After executing steps a–d for all discovered children, perform the position-delete readiness check described at the end of this step.
+   - **POSITION_DELETE jobs:** no children; proceed directly to step 4.
 
-   For each discovered child path, execute the following before proceeding to step 4:
+   For each discovered child path, execute the following:
 
    **a.** Upsert the child job (resolve `id` via RETURNING or SELECT on the UNIQUE key):
    ```sql
@@ -627,12 +628,14 @@ For each claimed job:
    JOIN   metadata_version_jobs mvj ON mvj.id = mvfd.metadata_version_id
    WHERE  mvfd.file_job_id = :parent_job_id
      AND  mvj.status NOT IN ('SUPERSEDED', 'APPLIED')
-   ON CONFLICT DO NOTHING
+   ON CONFLICT (metadata_version_id, file_job_id)
+   DO UPDATE SET is_current_snapshot = TRUE
+   WHERE NOT metadata_version_file_deps.is_current_snapshot
    ```
 
    **d.** **If the child job is already in DONE state** (it was fully processed for a
    prior version), its own descendants are already recorded in `file_job_children`.
-   Cascade them into deps for all versions now referencing the child:
+   Cascade them into deps for all non-terminal versions now referencing the child:
    ```sql
    WITH RECURSIVE descendants AS (
        SELECT child_job_id FROM file_job_children WHERE parent_job_id = :done_child_id
@@ -644,30 +647,60 @@ For each claimed job:
    SELECT mvfd.metadata_version_id, d.child_job_id, :is_current_snapshot
    FROM   descendants d
    CROSS JOIN (
-       SELECT metadata_version_id FROM metadata_version_file_deps
-       WHERE  file_job_id = :done_child_id
+       SELECT mvfd2.metadata_version_id
+       FROM   metadata_version_file_deps mvfd2
+       JOIN   metadata_version_jobs mvj ON mvj.id = mvfd2.metadata_version_id
+       WHERE  mvfd2.file_job_id = :done_child_id
+         AND  mvj.status NOT IN ('SUPERSEDED', 'APPLIED')
    ) mvfd
-   ON CONFLICT DO NOTHING
+   ON CONFLICT (metadata_version_id, file_job_id)
+   DO UPDATE SET is_current_snapshot = TRUE
+   WHERE NOT metadata_version_file_deps.is_current_snapshot
    ```
 
-   **Crash safety:** if the worker crashes after writing `dest_path` (step 2) but before
-   completing child discovery (step 3), the job remains CLAIMED; its lease expires and
-   another worker re-runs from step 1. The existence check on `dest_path` in step 2 detects
-   the already-written file and skips the write. The `ON CONFLICT DO NOTHING` clauses on
-   all three tables in step 3 make re-running discovery idempotent.
+   **MANIFEST jobs — position-delete readiness check (runs after steps a–d for all children):**
+   Query `file_rewrite_jobs` for the status of every position delete job enqueued in step a
+   above (matching by `source_path`):
+   - **All referenced position delete jobs are `DONE`:** proceed to step 4.
+   - **Any referenced position delete job is not `DONE`:** defer this manifest job —
+     reset `status = 'PENDING'`, clear `claimed_by` and `claimed_at`, set
+     `next_attempt_at = NOW() + <short fixed delay>` (e.g. 5–10 seconds; independent of
+     the exponential backoff schedule used for 404 retries). Do **not** increment
+     `attempts`. Return without proceeding to step 4.
 
-4. **All job types — complete:** mark job DONE. Run the completion check (Section 6.1
-   step 3) for all metadata versions referencing this job via `metadata_version_file_deps`.
+   **Crash safety:** if the worker crashes after child discovery (step 3) but before
+   writing `dest_path` (step 4), the job remains `CLAIMED`; its lease expires and another
+   worker re-runs from step 2. The existence check on `dest_path` in step 4 detects any
+   already-written file and skips the write. The idempotent SQL in steps a–d
+   (ON CONFLICT with conditional `is_current_snapshot` upsert) makes re-running
+   discovery safe. For MANIFEST jobs that were reset to `PENDING` during the readiness
+   check, the next worker picks them up cleanly via the normal claim query.
+
+4. **All job types — write and complete:** Apply deterministic path substitution (Section 8)
+   to the in-memory parsed content from step 2 and write the result to `dest_path` via
+   `S3FileIO`. To ensure idempotency, first check whether `dest_path` already exists using
+   `S3FileIO`'s `newInputFile(dest_path).exists()`; if it does, skip the write.
+   For MANIFEST jobs whose position delete children were confirmed `DONE` in step 3,
+   additionally fetch the new byte sizes of those rewritten position delete files via
+   `S3FileIO` before writing the manifest, so that `file_size_in_bytes` entries are
+   accurate per the Iceberg specification. Mark the job `DONE` and run the completion
+   check (Section 6.1 step 3) for all metadata versions referencing this job via
+   `metadata_version_file_deps`.
 5. **On 404:** the file may not yet have replicated, or may have been garbage-collected on
    the primary before replication occurred. These are indistinguishable without primary S3
    access.
    - Increment `attempts`; compute `next_attempt_at` using exponential backoff
-     (initial interval: 30 seconds; multiplier: 2; cap: 10 minutes)
-   - After exceeding configurable maximum attempts (default: 20) **or** when
-     `(NOW() - job creation time) > 2 × replica_config.s3_replication_sla_seconds`: set status to
-     `PERMANENTLY_FAILED` and record `last_error` for operator inspection
-   - Rationale: time-based heuristic is the only viable approach given that primary S3
-     is not accessible from the replica service
+     (initial interval: `retry_initial_interval_ms`; multiplier: 2; cap: `retry_max_interval_ms`)
+   - After `attempts` exceeds `max_retry_attempts` (default: 20) **or** when
+     `(NOW() - job_created_at) > permanently_failed_timeout_seconds` (default: 14 400 s —
+     4 hours): set status to `PERMANENTLY_FAILED` and record `last_error` for operator
+     inspection. The timeout default is deliberately larger than total retry-exhaustion
+     time (~165 min with defaults) so that `max_retry_attempts` is the primary trigger for
+     files that will never arrive; the time threshold acts as a safety net for anomalous
+     cases (e.g. a bug preventing `attempts` from incrementing).
+   - Rationale: primary S3 is inaccessible from the replica service, so distinguishing
+     "not yet replicated" from "permanently absent" requires both a retry budget and a
+     wall-clock backstop.
 
 ### 7.6 Idempotency
 
@@ -751,12 +784,13 @@ However, Iceberg manifest files strictly record the physical byte size (`file_si
 To optimize throughput, manifest file processing is strictly conditional based on its actual contents:
 
 1. **Manifests without position deletes (Optimization Path):** The vast majority of manifests only contain data files or equality delete files (which are not rewritten). These manifest jobs can be processed immediately and asynchronously. The worker applies path substitutions in-memory, writes the new manifest to `write.metadata.path`, and marks the job `DONE` without waiting on any other jobs.
-2. **Manifests with position deletes (Dependency Path):** When a worker claims a manifest job and discovers it contains position delete entries, it must ensure those specific files are fully rewritten to capture their new file sizes.
-    * The worker identifies the referenced position delete `source_path` values and queries `file_rewrite_jobs`.
-    * **If all referenced position delete jobs are `DONE`:** The worker fetches their new file sizes (via `S3FileIO`), applies the deterministic path substitutions, writes the new manifest, and marks the job `DONE`.
-    * **If any referenced position delete jobs are not `DONE`:** The worker aborts the rewrite, releases the claim, and defers the job by updating `next_attempt_at` with a short delay.
+2. **Manifests with position deletes (Dependency Path):** When a worker claims a manifest job and discovers it contains position delete entries, it must ensure those specific files are fully rewritten to capture their new file sizes. The processing order is:
+    * **Child discovery first (unconditional):** The worker executes §7.5 step 3 (steps a–d) for all referenced position delete paths. This inserts the position delete jobs into `file_rewrite_jobs` if they do not already exist (idempotent), registers the parent→child relationships, and propagates dep rows to all referencing metadata versions. This step always runs, regardless of whether the write proceeds.
+    * **Readiness check:** The worker queries `file_rewrite_jobs` for the status of all referenced position delete jobs (now guaranteed to exist from the step above).
+    * **If all referenced position delete jobs are `DONE`:** The worker fetches their new byte sizes (via `S3FileIO`), applies the deterministic path substitutions, writes the new manifest to `write.metadata.path`, and marks the job `DONE`.
+    * **If any referenced position delete jobs are not `DONE`:** The worker resets the job to `PENDING` (`status = 'PENDING'`, `claimed_by` and `claimed_at` cleared, `next_attempt_at` set to a short fixed delay of 5–10 seconds). The `attempts` counter is **not** incremented — this is a routine scheduling deferral, not an S3 availability failure. The manifest is not written to `dest_path`.
 
-This ensures that the dependency bottleneck is only incurred when absolutely necessary, allowing parallel processing for the rest of the metadata tree. No separate dependency-tracking table is required for this phase; the check is a targeted query against `file_rewrite_jobs` at rewrite time.
+This ensures that the dependency bottleneck is only incurred when absolutely necessary, allowing parallel processing for the rest of the metadata tree. No separate dependency-tracking table is required for this phase; the check is a targeted query against `file_rewrite_jobs` after child discovery ensures all rows exist.
 
 ### 8.6 Expired Snapshots
 
@@ -795,7 +829,12 @@ for writes. On fail-over it becomes the new primary.
 
 **Fail-Over (operator-triggered):**
 1. Operator records the fail-over event (timestamp) using the `declare-failover` CLI
-   command (Section 10). This writes to `failover_events` on both sites.
+   command (Section 10). This writes to `failover_events` on the replica's own writable
+   PostgreSQL. If the primary site is reachable at the time of the command, it also
+   attempts a best-effort write to the primary's `failover_events`; if the primary is
+   unreachable (the common case during a fail-over), this attempt is silently skipped.
+   All functional logic — including snapshot rollback boundary identification for
+   fail-back — relies exclusively on the replica-side record.
 2. Operator reconfigures S3 replication: Site B now replicates to Site A, with write
    location prefixes excluded from replication scope on both sides.
 3. Site B operates as primary (writes go directly to its Iceberg catalog; replication
@@ -811,7 +850,14 @@ timestamp), those snapshots must be dropped before replication can resume cleanl
 2. On Site A's primary Iceberg catalog, use `ManageSnapshots.rollbackTo(snapshotId)`,
    where `snapshotId` is the latest snapshot whose `timestamp-ms` is earlier than
    `(failover_timestamp - 60 seconds)`. The 60-second tolerance accommodates clock drift
-   between sites.
+   between sites. This is performed via the `rollback-primary` CLI command (Section 10),
+   which requires write-capable JDBC access to Site A's primary PostgreSQL catalog.
+   Because the replica service does not normally hold write credentials for the primary,
+   `rollback-primary` must either (a) be executed directly on Site A using Site A's own
+   catalog credentials, or (b) accept `--primary-jdbc-url` and credential arguments
+   specifying a writable connection to Site A's catalog for use during fail-back only.
+   The read-only replica connection used by the `status` command is insufficient for
+   this operation.
 3. Run `ExpireSnapshots` on Site A to clean up data files associated with rolled-back
    snapshots.
 4. Operator reconfigures S3 replication back to the original direction (Site A → Site B),
@@ -833,7 +879,7 @@ The replication service is a single Picocli-based binary exposing the following 
 | `run`               | Start the continuous replication loop                                 |
 | `init-replica`      | Initialise writable PostgreSQL schema; write replica configuration    |
 | `declare-failover`  | Record a fail-over event with current (or specified) timestamp        |
-| `rollback-primary`  | Run `ManageSnapshots.rollbackTo()` to last pre-failover snapshot      |
+| `rollback-primary`  | Run `ManageSnapshots.rollbackTo()` to last pre-failover snapshot on Site A's primary catalog. Requires write-capable JDBC access to Site A (see §9.2 fail-back) |
 | `status`            | Report per-table replication lag, PERMANENTLY_FAILED job counts       |
 
 The `PERMANENTLY_FAILED` job state is the primary alerting surface for operators. The
