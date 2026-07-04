@@ -224,7 +224,8 @@ DataWriter<Record> writer = Parquet.writeData(outputFile)
     .build();
 
 for (FileScanTask task : tasks) {
-  GenericDeleteFilter deletes = new GenericDeleteFilter(table.io(), task, table.schema(), table.schema());
+  GenericDeleteFilter<Record> deletes =
+      new GenericDeleteFilter<>(table.io(), task, table.schema(), table.schema());
   try (CloseableIterable<Record> rows = deletes.filter(openRows(task))) {
     for (Record r : rows) writer.write(r);
   }
@@ -243,6 +244,44 @@ try {
   // the next planning pass re-derives everything from fresh metadata
 }
 ```
+
+`openRows` is a format-aware helper that opens the raw (pre-delete-filtering) rows from a data file using the table's `FileIO`. `GenericDeleteFilter` wraps its output and applies positional and equality deletes before any record reaches the writer.
+
+```java
+private CloseableIterable<Record> openRows(FileScanTask task) {
+  DataFile file = task.file();
+  InputFile inputFile = table.io().newInputFile(file.path().toString());
+  Schema schema = table.schema();
+
+  switch (file.format()) {
+    case PARQUET:
+      return Parquet.read(inputFile)
+          .project(schema)
+          .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+          .split(task.start(), task.length())
+          .build();
+    case ORC:
+      return ORC.read(inputFile)
+          .project(schema)
+          .createReaderFunc(fileSchema -> GenericOrcReader.buildReader(schema, fileSchema))
+          .split(task.start(), task.length())
+          .build();
+    case AVRO:
+      return Avro.read(inputFile)
+          .project(schema)
+          .createReaderFunc(DataReader::create)
+          .split(task.start(), task.length())
+          .build();
+    default:
+      throw new UnsupportedOperationException("Unsupported file format: " + file.format());
+  }
+}
+```
+
+Notes on `openRows`:
+- **Split offsets.** `task.start()` and `task.length()` are passed through explicitly. For whole-file compaction tasks they will be `0` and `file.fileSizeInBytes()` respectively, but threading them through keeps the code correct if scan planning ever subdivides a file.
+- **Full schema projection.** Passing `table.schema()` reads all columns, which is correct for compaction. A narrower `requestedSchema` could be threaded through if needed for future use cases such as sort-only rewrites.
+- **Delete resolution.** `GenericDeleteFilter.filter()` receives the raw unfiltered `CloseableIterable<Record>` returned here and produces a delete-resolved stream — the result is what gets written to the new compacted file.
 
 A positional-delete file whose `referencedDataFile()` matches one of the files in this job is fully absorbed once the rewrite completes (its target rows are simply missing from `newFile`), so it's removed in the same commit rather than left to linger.
 
