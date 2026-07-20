@@ -1,0 +1,17 @@
+<configuration>
+
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Iceberg's own core/data/parquet classes log a fair amount at DEBUG; keep them at INFO
+       so the compactor's own log lines aren't drowned out. -->
+  <logger name="org.apache.iceberg" level="INFO"/>
+
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+
+</configuration>

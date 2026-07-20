@@ -1,0 +1,23 @@
+[versions]
+iceberg = "1.11.0"
+slf4j = "2.0.17"
+logback = "1.5.18"
+junit = "5.14.2"
+
+[libraries]
+# Iceberg API/implementation. iceberg-core pulls in iceberg-api transitively.
+iceberg-core = { module = "org.apache.iceberg:iceberg-core", version.ref = "iceberg" }
+# Generic in-memory Record model + IcebergGenerics + GenericDeleteFilter.
+iceberg-data = { module = "org.apache.iceberg:iceberg-data", version.ref = "iceberg" }
+# Parquet read/write support (org.apache.iceberg.data.parquet.*, org.apache.iceberg.parquet.Parquet).
+iceberg-parquet = { module = "org.apache.iceberg:iceberg-parquet", version.ref = "iceberg" }
+
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+
+[bundles]
+iceberg = ["iceberg-core", "iceberg-data", "iceberg-parquet"]
