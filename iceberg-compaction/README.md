@@ -5,7 +5,7 @@ partition of an Apache Iceberg table, prioritizing the most recent dates, and cl
 delete files that become redundant as a result.
 
 Design rationale, the file-selection algorithm (with worked examples), and exact API notes are in
-[`docs/iceberg-compaction-plan-v2.md`](docs/iceberg-compaction-plan-v2.md) — read that first if
+[`docs/iceberg-compaction-plan.md`](docs/iceberg-compaction-plan.md) — read that first if
 you're modifying this code or porting it to a different Iceberg version; it also lists exactly
 which API details are worth re-verifying against source if so.
 
