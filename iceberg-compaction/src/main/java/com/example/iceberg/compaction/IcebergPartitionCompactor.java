@@ -421,14 +421,21 @@ public final class IcebergPartitionCompactor {
 
     List<FileInfo> files = new ArrayList<>();
     boolean missingStats = false;
+    int currentSpecId = spec.specId();
     try (CloseableIterable<Record> rows =
         IcebergGenerics.read(filesTable)
-            .select("content", "file_path", "file_size_in_bytes", "lower_bounds")
+            .select("content", "file_path", "file_size_in_bytes", "lower_bounds", "spec_id")
             .where(filter)
             .build()) {
       for (Record row : rows) {
         int content = ((Number) row.getField("content")).intValue();
         if (content != 0) { // 0 == DATA; see org.apache.iceberg.FileContent
+          continue;
+        }
+        // Defense in depth on top of Stage 1's PARTITIONS-row-level spec_id filter: skip any
+        // individual file not written under the table's current spec, see class Javadoc.
+        int fileSpecId = ((Number) row.getField("spec_id")).intValue();
+        if (fileSpecId != currentSpecId) {
           continue;
         }
         String path = row.getField("file_path").toString();
@@ -712,12 +719,23 @@ public final class IcebergPartitionCompactor {
           "Starting compaction job for partition {}: {} file(s)", partitionValues, jobFiles.size());
 
       List<FileScanTask> tasks = new ArrayList<>();
+      int specMismatches = 0;
       try (CloseableIterable<FileScanTask> planned =
           table.newScan().useSnapshot(startingSnapshotId).filter(scanPruningFilter()).planFiles()) {
+        int currentSpecId = table.spec().specId();
         for (FileScanTask t : planned) {
-          if (wantedPaths.contains(t.file().location())) {
-            tasks.add(t);
+          if (!wantedPaths.contains(t.file().location())) {
+            continue;
           }
+          // Defense in depth on top of Stage 1's spec_id filter (which filters PARTITIONS rows,
+          // not individual files): never rewrite a file that isn't under the table's *current*
+          // spec, even if it slipped through planning or the spec changed since then. Treated
+          // exactly like a missing file below - the job is dropped, not partially run.
+          if (t.file().specId() != currentSpecId) {
+            specMismatches++;
+            continue;
+          }
+          tasks.add(t);
         }
       } catch (IOException e) {
         throw new UncheckedIOException("Failed planning input files for compaction job", e);
@@ -726,12 +744,14 @@ public final class IcebergPartitionCompactor {
       if (tasks.size() != wantedPaths.size()) {
         LOG.warn(
             "Compaction job for partition {} skipped: expected {} file(s) but found {} at "
-                + "snapshot {}. Another writer likely already touched this partition; it will be "
-                + "re-planned on the next compaction pass.",
+                + "snapshot {} ({} excluded for not matching the table's current partition spec). "
+                + "Another writer likely already touched this partition, or the spec changed; it "
+                + "will be re-planned on the next compaction pass.",
             partitionValues,
             wantedPaths.size(),
             tasks.size(),
-            startingSnapshotId);
+            startingSnapshotId,
+            specMismatches);
         return;
       }
       tasks = orderLikeJobFiles(tasks);
@@ -834,16 +854,20 @@ public final class IcebergPartitionCompactor {
     private DataFile writeMergedDataFile(List<FileScanTask> tasks, StructLike outputPartition) throws IOException {
       OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 0, 0).format(FileFormat.PARQUET).build();
       EncryptedOutputFile encryptedOutputFile = fileFactory.newOutputFile(table.spec(), outputPartition);
-      OutputFile outputFile = encryptedOutputFile.encryptingOutputFile();
+      String outputLocation = encryptedOutputFile.encryptingOutputFile().location();
 
       try {
-        DataWriter<Record> writer =
-            Parquet.writeData(outputFile)
-                .schema(table.schema())
-                .withSpec(table.spec())
-                .withPartition(outputPartition)
-                .createWriterFunc(GenericParquetWriter::buildWriter)
+        // GenericFileWriterFactory (rather than calling Parquet.writeData(...) directly) is what
+        // keeps this class from needing org.apache.parquet.schema.MessageType - or any other
+        // Parquet-specific class - on its compile classpath at all: the factory looks up the
+        // registered Parquet FormatModel (from iceberg-parquet, needed only at runtime) via
+        // FormatModelRegistry internally. See the class Javadoc's dependency note.
+        FileWriterFactory<Record> writerFactory =
+            GenericFileWriterFactory.builderFor(table)
+                .dataSchema(table.schema())
+                .dataFileFormat(FileFormat.PARQUET)
                 .build();
+        DataWriter<Record> writer = writerFactory.newDataWriter(encryptedOutputFile, table.spec(), outputPartition);
         try {
           for (FileScanTask t : tasks) {
             GenericDeleteFilter deleteFilter =
@@ -859,7 +883,7 @@ public final class IcebergPartitionCompactor {
         }
         return writer.toDataFile();
       } catch (IOException | RuntimeException e) {
-        safeDelete(outputFile.location());
+        safeDelete(outputLocation);
         throw e;
       }
     }
@@ -876,9 +900,11 @@ public final class IcebergPartitionCompactor {
                 + " for "
                 + file.location());
       }
-      return Parquet.read(inputFile)
+      // Same rationale as writeMergedDataFile: go through the format registry rather than
+      // Parquet.read(...) directly, so this class never needs to compile against Parquet's own
+      // classes.
+      return FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, inputFile)
           .project(readSchema)
-          .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(readSchema, fileSchema))
           .split(task.start(), task.length())
           .build();
     }
