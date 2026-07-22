@@ -873,7 +873,7 @@ public final class IcebergPartitionCompactor {
         // registered Parquet FormatModel (from iceberg-parquet, needed only at runtime) via
         // FormatModelRegistry internally. See the class Javadoc's dependency note.
         FileWriterFactory<Record> writerFactory =
-            GenericFileWriterFactory.builderFor(table)
+            new GenericFileWriterFactory.Builder(table)
                 .dataSchema(table.schema())
                 .dataFileFormat(FileFormat.PARQUET)
                 .build();
