@@ -30,23 +30,22 @@ import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericDeleteFilter;
+import org.apache.iceberg.data.GenericFileWriterFactory;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.OutputFileFactory;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.transforms.Transform;
 import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
@@ -88,10 +87,21 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li>Only partitions written under the table's <em>current</em> partition spec are
- *       considered; data under a historical, evolved-away spec id is left alone.
- *   <li>Only Parquet data files are read/written, to keep the dependency footprint small. A
- *       table using ORC or Avro data files will cause a job touching those files to fail with
- *       {@link UnsupportedOperationException}.
+ *       considered; data under a historical, evolved-away spec id is left alone. This is
+ *       enforced twice: once when discovering candidate partitions (§ {@code spec_id} on the
+ *       {@code PARTITIONS} table) and again, per file, immediately before it would be rewritten
+ *       (§ {@code spec_id} on the {@code FILES} table and on each freshly-scanned {@link
+ *       DataFile}) - the second check is what protects against the spec changing between
+ *       planning and a job actually running.
+ *   <li>Reading and writing goes through Iceberg's format registry ({@link
+ *       FormatModelRegistry}, {@link GenericFileWriterFactory}) rather than calling {@code
+ *       org.apache.iceberg.parquet.Parquet} directly, specifically so this class never needs
+ *       {@code org.apache.parquet.schema.MessageType} (or any other Parquet-internal class) on
+ *       its own compile classpath - only Parquet's own registered {@code FormatModel} does,
+ *       inside {@code iceberg-parquet}, which this library only needs at <em>runtime</em>. A
+ *       table using ORC or Avro data files will still cause a job touching those files to fail
+ *       with {@link UnsupportedOperationException}, since only Parquet is registered as a
+ *       runtime dependency here (see the Gradle build file to add another format).
  *   <li>Only <em>position</em> delete files that are scoped to a single data file (i.e.
  *       {@link DeleteFile#referencedDataFile()} is set) are ever removed, and only when that
  *       referenced data file is one of the ones being rewritten. Equality deletes are never

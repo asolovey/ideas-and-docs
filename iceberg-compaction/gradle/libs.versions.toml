@@ -20,4 +20,4 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 
 [bundles]
-iceberg = ["iceberg-core", "iceberg-data", "iceberg-parquet"]
+iceberg = ["iceberg-core", "iceberg-data"]

@@ -28,18 +28,18 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericFileWriterFactory;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DataWriter;
-import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.OutputFileFactory;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -398,17 +398,16 @@ class IcebergPartitionCompactorTest {
     PartitionKey pk = new PartitionKey(table.spec(), table.schema());
     pk.partition(rows.get(0));
 
-    OutputFileFactory factory =
+    OutputFileFactory outFactory =
         OutputFileFactory.builderFor(table, 0, fileSeq.incrementAndGet()).format(FileFormat.PARQUET).build();
-    OutputFile out = factory.newOutputFile(table.spec(), pk).encryptingOutputFile();
+    EncryptedOutputFile out = outFactory.newOutputFile(table.spec(), pk);
 
-    DataWriter<Record> writer =
-        Parquet.writeData(out)
-            .schema(table.schema())
-            .withSpec(table.spec())
-            .withPartition(pk)
-            .createWriterFunc(GenericParquetWriter::buildWriter)
-            .build();
+    // GenericFileWriterFactory (rather than Parquet.writeData(...) directly) avoids needing
+    // org.apache.parquet.schema.MessageType on the compile classpath - see the main class's
+    // Javadoc for why.
+    FileWriterFactory<Record> writerFactory =
+        GenericFileWriterFactory.builderFor(table).dataSchema(table.schema()).dataFileFormat(FileFormat.PARQUET).build();
+    DataWriter<Record> writer = writerFactory.newDataWriter(out, table.spec(), pk);
     try {
       for (Record r : rows) {
         writer.write(r);
@@ -421,14 +420,19 @@ class IcebergPartitionCompactorTest {
 
   private DeleteFile writePositionDeleteFile(Table table, PartitionKey pk, String dataFileLocation, long... positions)
       throws IOException {
-    OutputFileFactory factory =
+    OutputFileFactory outFactory =
         OutputFileFactory.builderFor(table, 0, fileSeq.incrementAndGet()).format(FileFormat.PARQUET).build();
-    OutputFile out = factory.newOutputFile(table.spec(), pk).encryptingOutputFile();
+    EncryptedOutputFile out = outFactory.newOutputFile(table.spec(), pk);
 
-    PositionDeleteWriter<Void> writer =
-        Parquet.writeDeletes(out).withSpec(table.spec()).withPartition(pk).buildPositionWriter();
+    FileWriterFactory<Record> writerFactory =
+        GenericFileWriterFactory.builderFor(table)
+            .dataSchema(table.schema())
+            .dataFileFormat(FileFormat.PARQUET)
+            .deleteFileFormat(FileFormat.PARQUET)
+            .build();
+    PositionDeleteWriter<Record> writer = writerFactory.newPositionDeleteWriter(out, table.spec(), pk);
     try {
-      PositionDelete<Void> positionDelete = PositionDelete.create();
+      PositionDelete<Record> positionDelete = PositionDelete.create();
       for (long pos : positions) {
         positionDelete.set(dataFileLocation, pos);
         writer.write(positionDelete);

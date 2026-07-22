@@ -15,8 +15,15 @@ repositories {
 }
 
 dependencies {
-    // Plain Iceberg Java API - core table/catalog model, generic Record data model, Parquet I/O.
+    // Plain Iceberg Java API - core table/catalog model and the generic Record data model.
     implementation(libs.bundles.iceberg)
+
+    // Parquet support is only needed at *runtime*: reading/writing goes through Iceberg's
+    // format registry (FormatModelRegistry / GenericFileWriterFactory, both in iceberg-core /
+    // iceberg-data), which looks up iceberg-parquet's registered FormatModel dynamically. This
+    // class deliberately never imports anything from org.apache.iceberg.parquet or
+    // org.apache.parquet.* directly - see IcebergPartitionCompactor's class Javadoc.
+    runtimeOnly(libs.iceberg.parquet)
 
     // Logging: slf4j API at compile time, logback as the runtime backend.
     implementation(libs.slf4j.api)

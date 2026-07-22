@@ -87,7 +87,10 @@ for (Future<?> f : futures) {
 See `docs/iceberg-compaction-plan-v2.md` §5 and §13 for the reasoning behind each of these:
 
 - Only partitions written under the table's *current* partition spec are considered; data under
-  a historical, evolved-away spec id is left alone.
+  a historical, evolved-away spec id is left alone. This is checked twice — once when discovering
+  candidate partitions and again, per file, immediately before it would be rewritten — so a spec
+  change between planning and a job actually running is caught rather than silently rewriting a
+  file under the wrong spec.
 - Only Parquet data files are read/written (kept dependencies minimal); a table using ORC or Avro
   data files will fail a job with `UnsupportedOperationException`.
 - Only position delete files scoped to a single data file (`referencedDataFile() != null`) are
@@ -121,3 +124,14 @@ Two things were done to compensate, and are worth knowing about if something doe
    and bin-packing algorithm specifically (the trickiest, most bug-prone logic) was additionally
    extracted verbatim and run against the worked examples from the design doc plus several
    adversarial edge cases with plain `java`, independent of any Iceberg stub.
+
+A real build (with actual Maven Central access) did subsequently surface one gap this process
+missed: calling `Parquet.writeData(...)`/`GenericParquetWriter::buildWriter` directly requires
+`org.apache.parquet.schema.MessageType` on the compile classpath, which the default
+`iceberg-parquet` dependency doesn't provide (`error: cannot access MessageType`). This is now
+fixed by routing through 1.11.0's `GenericFileWriterFactory`/`FormatModelRegistry` instead (see
+`docs/iceberg-compaction-plan-v2.md` §10.2 for the full explanation), which also means
+`iceberg-parquet` only needs to be a `runtimeOnly` dependency — nothing in this codebase compiles
+against it directly anymore. If you hit further compile errors, they're most likely in this same
+family (a class whose signature reaches into a format-specific package); the fix is usually to
+find the registry-based equivalent rather than adding the missing dependency directly.

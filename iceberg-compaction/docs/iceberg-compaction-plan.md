@@ -145,6 +145,15 @@ field remapping `PartitionsTable` already does internally, which is a lot of mac
 maintenance job that can simply defer those (usually old, usually already-compacted) files to a
 separate pass if it ever matters.
 
+This is enforced **twice**, not once, and deliberately so: once cheaply at partition-discovery
+time (§6, filtering `PARTITIONS` rows), and again per individual file, immediately before it would
+actually be rewritten (§7's `FILES`-table `spec_id` column, and re-checked against each freshly
+re-scanned `DataFile.specId()` in §10.1). The second check is not redundant with the first: a job
+can be planned long before it runs (§4), and the table's current spec can change in between: a
+concurrent partition-spec-evolution commit would otherwise be invisible to a job that only checked
+spec_id once, back at planning time. A file that fails the second check is treated exactly like a
+file that's gone missing — the whole job is dropped without partial-completing it (§10.1).
+
 ## 6. Stage 1 — Partition discovery (`PARTITIONS` metadata table)
 
 ```java
@@ -444,11 +453,35 @@ exactly like a commit conflict rather than attempted anyway.
 
 ### 10.2 Read, apply deletes, write
 
+**Go through Iceberg's format registry, not `Parquet.write`/`Parquet.read` directly - this isn't
+just a style preference, the direct approach doesn't compile for a consumer.** An earlier version
+of this plan called `Parquet.writeData(outputFile).createWriterFunc(GenericParquetWriter::buildWriter)`
+directly, matching how plenty of Iceberg example code still looks. Against a real dependency, that
+produces:
+
+```
+error: cannot access MessageType
+                  .createWriterFunc(GenericParquetWriter::buildWriter)
+                  ^
+  class file for org.apache.parquet.schema.MessageType not found
+```
+
+`GenericParquetWriter.buildWriter`'s signature mentions `org.apache.parquet.schema.MessageType`,
+which lives in a Parquet artifact that `iceberg-parquet` depends on internally but does not
+re-expose to its own consumers at compile time. Referencing `GenericParquetWriter` (or
+`GenericParquetReaders`) directly, from outside Iceberg's own build, requires that Parquet
+artifact on *your* compile classpath too, and default transitive resolution doesn't put it there.
+
+1.11.0's new, registry-based File Format API sidesteps this rather than patching around it: go
+through `GenericFileWriterFactory`/`FormatModelRegistry`, and no Parquet-specific type ever
+appears in the signature of anything this code calls, so nothing needs to compile against it:
+
 ```java
-DataWriter<Record> writer = Parquet.writeData(outputFile)
-    .schema(table.schema()).withSpec(table.spec()).withPartition(outputPartition)
-    .createWriterFunc(GenericParquetWriter::buildWriter)
+FileWriterFactory<Record> writerFactory = GenericFileWriterFactory.builderFor(table)
+    .dataSchema(table.schema())
+    .dataFileFormat(FileFormat.PARQUET)
     .build();
+DataWriter<Record> writer = writerFactory.newDataWriter(encryptedOutputFile, table.spec(), outputPartition);
 
 for (FileScanTask task : tasks) { // in the same time-sorted order the job was planned in
   GenericDeleteFilter deleteFilter =
@@ -460,6 +493,37 @@ for (FileScanTask task : tasks) { // in the same time-sorted order the job was p
 writer.close();
 DataFile newFile = writer.toDataFile();
 ```
+
+`openRows` (§10.1's per-task raw read, ahead of delete filtering) gets the same treatment - swap
+`Parquet.read(inputFile).createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(readSchema, fileSchema))`
+for:
+
+```java
+FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, inputFile)
+    .project(readSchema)
+    .split(task.start(), task.length())
+    .build();
+```
+
+(This exact substitution - same `.project()`/`.split()`/`.build()` chain, registry entry point
+swapped in for the old static builder - is how Iceberg migrated its own internal call sites to the
+new API, e.g. a Spark-side Parquet-reading benchmark went from
+`Parquet.read(file).project(SCHEMA).createReaderFunc(type -> SparkParquetReaders.buildReader(SCHEMA, type)).build()`
+to `FormatModelRegistry.readBuilder(FileFormat.PARQUET, InternalRow.class, file).project(SCHEMA).build()`
+- no `createReaderFunc` call at all, since the registry already knows which reader function a
+registered `ParquetFormatModel` for `InternalRow`/`Record` uses internally.)
+
+Both `GenericFileWriterFactory` (`org.apache.iceberg.data`) and `FormatModelRegistry`
+(`org.apache.iceberg.formats`) live in `iceberg-core`/`iceberg-data`, not `iceberg-parquet`. The
+actual Parquet implementation is looked up from a registry entry that `iceberg-parquet` populates
+via its own static initialization - which only needs to happen at **runtime**. Concretely: declare
+`iceberg-parquet` `runtimeOnly` in Gradle rather than `implementation`; nothing in this codebase
+needs to compile against it, only run with it present. The same registry also supplies
+`newPositionDeleteWriter`/`newEqualityDeleteWriter` off the same `FileWriterFactory` (see §10.5
+and §12's test helper) and `equalityDeleteWriteBuilder`/`positionDeleteWriteBuilder` off
+`FormatModelRegistry` directly, for symmetry. If Iceberg ever registers ORC/Avro support the same
+way (it's heading there - see §13), adding another format is exactly one more `runtimeOnly`
+dependency line, no source change.
 
 **Correction from v1: `GenericDeleteFilter` is not generic.** It's a concrete class,
 `public class GenericDeleteFilter extends DeleteFilter<Record>` — construct and use it as
@@ -474,11 +538,14 @@ here) the requested schema is already the full table schema, the two coincide, b
 make it a no-op.
 
 **Output file construction.** Use `OutputFileFactory`, not a hand-built path — it handles unique
-naming and encryption transparently:
+naming and encryption transparently. Pass its `EncryptedOutputFile` straight into
+`newDataWriter`/`newPositionDeleteWriter`; there's no need to unwrap it via
+`.encryptingOutputFile()` yourself unless you specifically want the plain `OutputFile`/its
+location string (e.g. for logging, or to clean it up on failure):
 
 ```java
 OutputFileFactory factory = OutputFileFactory.builderFor(table, 0, 0).format(FileFormat.PARQUET).build();
-OutputFile outputFile = factory.newOutputFile(table.spec(), outputPartition).encryptingOutputFile();
+EncryptedOutputFile outputFile = factory.newOutputFile(table.spec(), outputPartition);
 ```
 
 (`outputPartition` here is any one of the job's `FileScanTask`s' `.file().partition()` — they're
@@ -630,13 +697,17 @@ deterministically:
   "large" and assert zero jobs get planned. Both are exact, not probabilistic.
 - **`PartitionKey`** (`org.apache.iceberg.PartitionKey`, `new PartitionKey(spec, schema)` then
   `.partition(someRow)`) computes a correct partition tuple from a representative row by actually
-  applying the spec's transforms — this is the right way to get a `StructLike` for
-  `OutputFileFactory`/`Parquet.writeData(...).withPartition(...)` in test helpers, and avoids
-  hand-computing a `day` transform's value.
-- **Writing a position delete file for a test** uses a parallel builder to the data-file one:
-  `Parquet.writeDeletes(outputFile).withSpec(spec).withPartition(partitionKey).buildPositionWriter()`,
-  then `PositionDelete.create()`, `.set(dataFileLocation, position)` (deliberately not writing row
-  data — see §13), `writer.write(positionDelete)`, then `writer.close()` /
+  applying the spec's transforms — this is the right way to get a `StructLike` to write test data
+  into, and avoids hand-computing a `day` transform's value.
+- **Writing data and position-delete files for tests** goes through the same
+  `GenericFileWriterFactory` as the compactor itself (§10.2) rather than `Parquet.writeData`/
+  `Parquet.writeDeletes` directly, for the same reason: `GenericFileWriterFactory.builderFor(table)
+  .dataSchema(schema).dataFileFormat(FileFormat.PARQUET).deleteFileFormat(FileFormat.PARQUET)
+  .build()` gives a `FileWriterFactory<Record>` whose `newDataWriter(encryptedOutputFile, spec,
+  partitionKey)` and `newPositionDeleteWriter(encryptedOutputFile, spec, partitionKey)` cover both
+  cases without a test helper ever importing anything Parquet-specific either. For the position
+  delete itself: `PositionDelete.create()`, `.set(dataFileLocation, position)` (deliberately not
+  writing row data — see §13), `writer.write(positionDelete)`, then `writer.close()` /
   `writer.toDeleteFile()`, committed via `table.newRowDelta().addDeletes(deleteFile).commit()`.
 - **Simulating a commit conflict**: plan a job, then — through a *second*, independently-loaded
   `Table` handle from the same catalog (simulating a genuinely separate writer) — commit a
@@ -670,25 +741,31 @@ worth a quick source check rather than trusting either version of this document 
   live `DataFile`/`DeleteFile` object is called.
 - **`GenericDeleteFilter`'s generic-ness.** Confirm it's still a concrete, non-parameterized class
   over `Record` and hasn't itself become generic.
-- **The "File Format API".** 1.11.0 introduced a new, unified `FormatModel`/format-registry API
-  (`iceberg-core`/`iceberg-parquet`/`iceberg-orc` all gained "FormatModel" implementations) as an
-  eventual replacement for the per-format `Parquet.write()`/`Parquet.writeData()`/`ORC.write()`
-  static-builder style used throughout this plan. As of 1.11.0 the classic builders are still
-  present and unremarked-as-deprecated; this plan deliberately keeps using them for stability and
-  because they're far better documented. For a notably newer target version, check whether the
-  classic builders have since been deprecated or removed in favor of the FormatModel API, and if
-  so, port §10.2/§10.4's `openRows`/write-side code to it.
+- **The "File Format API".** Confirmed as the *cause* of a real compile failure, not just a future
+  possibility: 1.11.0's new `FormatModelRegistry`/`GenericFileWriterFactory` (§10.2) is what this
+  plan now uses, specifically because the classic `Parquet.writeData()`/`Parquet.read()` static
+  builders require `org.apache.parquet.schema.MessageType` on the *consumer's* compile classpath,
+  which default Gradle/Maven transitive resolution from `iceberg-parquet` alone doesn't provide.
+  For a notably newer target version, confirm `FormatModelRegistry`/`GenericFileWriterFactory`
+  are still the current entry points (they were brand new in 1.11.0, so a couple of releases of
+  churn on the exact builder methods - beyond the `.project()`/`.split()`/`.build()`/
+  `.dataSchema()`/`.dataFileFormat()` ones this plan relies on - wouldn't be surprising), and that
+  `iceberg-parquet` as `runtimeOnly` (rather than `implementation`) is still sufficient.
 - **Position deletes "with row data".** Being deprecated in favor of deletion-vector-style
   (path+position only, no embedded row) deletes; this plan already only ever writes the
   row-data-free form in tests and never writes deletes at all in the compactor itself, so this is
   informational rather than something to fix, but it's worth confirming the row-data variant
   hasn't been removed outright if anything in a newer version needs to read one.
-- **Format support scope.** The reference implementation only wires up Parquet read/write (not
-  ORC/Avro), specifically to avoid pulling in `iceberg-orc`'s Hadoop-flavored transitive
-  dependencies for a "minimum dependencies" requirement. If your target table can use ORC/Avro
-  data files, port `openRows` to add those cases back (the v1 draft's `openRows` shows the shape:
-  `ORC.read(...)`/`GenericOrcReader`, `Avro.read(...)`/`DataReader`), and expect to pull in the
-  corresponding modules.
+- **Format support scope.** The reference implementation only registers Parquet at runtime
+  (`runtimeOnly` on `iceberg-parquet`; see §10.2), specifically to avoid pulling in
+  `iceberg-orc`'s Hadoop-flavored transitive dependencies for a "minimum dependencies"
+  requirement, and because neither `openRows` nor the write path reference format-specific
+  classes anymore, unlike in the original per-format `switch` design. If your target table can
+  use ORC/Avro data files, this is now just a dependency change (add `iceberg-orc`/rely on
+  `iceberg-core`'s built-in Avro support, both `runtimeOnly`) plus relaxing `openRows`'s
+  `FileFormat.PARQUET`-only check and the equivalent guard in the write path - no new reader/
+  writer code needed, since `FormatModelRegistry`/`GenericFileWriterFactory` already dispatch on
+  `FileFormat` generically.
 - **Java baseline.** 1.11.0 requires Java 17+ (Java 11 support was dropped). Older target versions
   may support Java 11; newer ones may raise the floor further — check before assuming 17 is right.
 
