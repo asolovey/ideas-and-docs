@@ -13,7 +13,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
+import org.apache.iceberg.Accessor;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
@@ -88,9 +91,9 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li>Only partitions written under the table's <em>current</em> partition spec are
  *       considered; data under a historical, evolved-away spec id is left alone. This is
- *       enforced twice: once when discovering candidate partitions (ยง {@code spec_id} on the
+ *       enforced twice: once when discovering candidate partitions (ง {@code spec_id} on the
  *       {@code PARTITIONS} table) and again, per file, immediately before it would be rewritten
- *       (ยง {@code spec_id} on the {@code FILES} table and on each freshly-scanned {@link
+ *       (ง {@code spec_id} on the {@code FILES} table and on each freshly-scanned {@link
  *       DataFile}) - the second check is what protects against the spec changing between
  *       planning and a job actually running.
  *   <li>Reading and writing goes through Iceberg's format registry ({@link
@@ -365,37 +368,112 @@ public final class IcebergPartitionCompactor {
     int datePos = positionOf(unionType, dateField.fieldId());
     int shardPos = positionOf(unionType, shardField.fieldId());
 
+    Schema metaSchema = partitionsTable.schema();
+    Accessor<StructLike> partitionAccessor = accessorFor(metaSchema, "partition");
+    Accessor<StructLike> specIdAccessor = accessorFor(metaSchema, "spec_id");
+    Accessor<StructLike> fileCountAccessor = accessorFor(metaSchema, "file_count");
+
     List<PartitionCandidate> candidates = new ArrayList<>();
-    try (CloseableIterable<Record> rows =
-        IcebergGenerics.read(partitionsTable).select("partition", "spec_id", "file_count").build()) {
-      for (Record row : rows) {
-        int specId = ((Number) row.getField("spec_id")).intValue();
-        if (specId != spec.specId()) {
-          // Data written under a historical (evolved-away) spec is out of scope for this
-          // compactor; see the class Javadoc.
-          continue;
-        }
-        int fileCount = ((Number) row.getField("file_count")).intValue();
-        if (fileCount < minInputFiles) {
-          continue;
-        }
-        StructLike partition = (StructLike) row.getField("partition");
-        Integer shard = partition.get(shardPos, Integer.class);
-        if (shard == null || shard.intValue() != shardValue) {
-          continue;
-        }
-        LocalDate date = partition.get(datePos, LocalDate.class);
-        if (date == null) {
-          continue;
-        }
-        candidates.add(new PartitionCandidate(copyPartitionValues(partition, unionType), date, fileCount));
-      }
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed reading PARTITIONS metadata table for " + table.name(), e);
-    }
+    scanMetadataRows(
+        partitionsTable,
+        Expressions.alwaysTrue(),
+        row -> {
+          int specId = ((Number) specIdAccessor.get(row)).intValue();
+          if (specId != spec.specId()) {
+            // Data written under a historical (evolved-away) spec is out of scope for this
+            // compactor; see the class Javadoc.
+            return;
+          }
+          int fileCount = ((Number) fileCountAccessor.get(row)).intValue();
+          if (fileCount < minInputFiles) {
+            return;
+          }
+          StructLike partition = (StructLike) partitionAccessor.get(row);
+          Integer shard = extractInt(partition, shardPos);
+          if (shard == null || shard.intValue() != shardValue) {
+            return;
+          }
+          LocalDate date = extractDate(partition, datePos);
+          if (date == null) {
+            return;
+          }
+          candidates.add(new PartitionCandidate(copyPartitionValues(partition, unionType), date, fileCount));
+        });
 
     candidates.sort(Comparator.comparing((PartitionCandidate c) -> c.date).reversed());
     return candidates;
+  }
+
+  /**
+   * Scans a metadata table (e.g. {@code PARTITIONS}, {@code FILES}), invoking {@code rowConsumer}
+   * once per row.
+   *
+   * <p>Metadata tables are not backed by physical Parquet/ORC/Avro files - their rows are
+   * synthesized in memory - so they must be read via {@link TableScan#planFiles()}'s {@link
+   * DataTask#rows()}, not {@code IcebergGenerics.read(...)}. The latter routes through the same
+   * format registry used for real data files (see the class Javadoc's dependency note) and fails
+   * with {@code IllegalArgumentException: Format model is not registered for format METADATA}
+   * for exactly this reason.
+   */
+  private static void scanMetadataRows(
+      Table metadataTable, Expression filter, Consumer<StructLike> rowConsumer) {
+    try (CloseableIterable<FileScanTask> tasks = metadataTable.newScan().filter(filter).planFiles()) {
+      for (FileScanTask task : tasks) {
+        if (!task.isDataTask()) {
+          throw new IllegalStateException(
+              "Expected a DataTask scanning metadata table " + metadataTable.name() + ", got " + task.getClass());
+        }
+        try (CloseableIterable<StructLike> rows = task.asDataTask().rows()) {
+          for (StructLike row : rows) {
+            rowConsumer.accept(row);
+          }
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed reading metadata table " + metadataTable.name(), e);
+    }
+  }
+
+  private static Accessor<StructLike> accessorFor(Schema schema, String fieldName) {
+    return schema.accessorForField(requireField(schema, fieldName).fieldId());
+  }
+
+  /**
+   * Reads an integer-valued partition field defensively with respect to representation: a plain
+   * {@code Integer} either way, but future-proofed the same way as {@link #extractDate} in case
+   * that ever stops holding.
+   */
+  private static Integer extractInt(StructLike partition, int pos) {
+    Object value = partition.get(pos, Object.class);
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Number) {
+      return ((Number) value).intValue();
+    }
+    throw new IllegalStateException("Expected a numeric partition value, got " + value.getClass() + ": " + value);
+  }
+
+  /**
+   * Reads a date-valued partition field defensively with respect to representation: Iceberg's
+   * "generic" API surface (as used everywhere else in this class, e.g. reading rows through
+   * {@code Record}) represents a date as {@link LocalDate}, but internal/transform-oriented
+   * machinery represents it as an {@code Integer} epoch-day. Which one a given {@link StructLike}
+   * actually holds isn't guaranteed from the call site alone, so this accepts either rather than
+   * asserting one and risking an {@code IllegalStateException: Not an instance of...} at runtime.
+   */
+  private static LocalDate extractDate(StructLike partition, int pos) {
+    Object value = partition.get(pos, Object.class);
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof LocalDate) {
+      return (LocalDate) value;
+    }
+    if (value instanceof Number) {
+      return LocalDate.ofEpochDay(((Number) value).longValue());
+    }
+    throw new IllegalStateException("Expected a date partition value, got " + value.getClass() + ": " + value);
   }
 
   private static Map<String, Object> copyPartitionValues(StructLike partition, Types.StructType unionType) {
@@ -429,41 +507,46 @@ public final class IcebergPartitionCompactor {
     Table filesTable = MetadataTableUtils.createMetadataTableInstance(table, MetadataTableType.FILES);
     Expression filter = buildPartitionTupleFilter(spec, candidate.partitionValues);
 
-    List<FileInfo> files = new ArrayList<>();
-    boolean missingStats = false;
-    int currentSpecId = spec.specId();
-    try (CloseableIterable<Record> rows =
-        IcebergGenerics.read(filesTable)
-            .select("content", "file_path", "file_size_in_bytes", "lower_bounds", "spec_id")
-            .where(filter)
-            .build()) {
-      for (Record row : rows) {
-        int content = ((Number) row.getField("content")).intValue();
-        if (content != 0) { // 0 == DATA; see org.apache.iceberg.FileContent
-          continue;
-        }
-        // Defense in depth on top of Stage 1's PARTITIONS-row-level spec_id filter: skip any
-        // individual file not written under the table's current spec, see class Javadoc.
-        int fileSpecId = ((Number) row.getField("spec_id")).intValue();
-        if (fileSpecId != currentSpecId) {
-          continue;
-        }
-        String path = row.getField("file_path").toString();
-        long size = ((Number) row.getField("file_size_in_bytes")).longValue();
-        @SuppressWarnings("unchecked")
-        Map<Integer, ByteBuffer> lowerBounds = (Map<Integer, ByteBuffer>) row.getField("lower_bounds");
-        ByteBuffer bound = lowerBounds == null ? null : lowerBounds.get(orderingFieldId);
-        if (bound == null) {
-          missingStats = true;
-          break;
-        }
-        files.add(new FileInfo(path, size, extractOrderKey(bound)));
-      }
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed reading FILES metadata table for " + table.name(), e);
-    }
+    Schema metaSchema = filesTable.schema();
+    Accessor<StructLike> contentAccessor = accessorFor(metaSchema, "content");
+    Accessor<StructLike> pathAccessor = accessorFor(metaSchema, "file_path");
+    Accessor<StructLike> sizeAccessor = accessorFor(metaSchema, "file_size_in_bytes");
+    Accessor<StructLike> lowerBoundsAccessor = accessorFor(metaSchema, "lower_bounds");
+    Accessor<StructLike> specIdAccessor = accessorFor(metaSchema, "spec_id");
 
-    if (missingStats) {
+    List<FileInfo> files = new ArrayList<>();
+    AtomicBoolean missingStats = new AtomicBoolean(false);
+    int currentSpecId = spec.specId();
+    scanMetadataRows(
+        filesTable,
+        filter,
+        row -> {
+          if (missingStats.get()) {
+            return; // already found a problem; see the comment below on why this doesn't abort the scan
+          }
+          int content = ((Number) contentAccessor.get(row)).intValue();
+          if (content != 0) { // 0 == DATA; see org.apache.iceberg.FileContent
+            return;
+          }
+          // Defense in depth on top of Stage 1's PARTITIONS-row-level spec_id filter: skip any
+          // individual file not written under the table's current spec, see class Javadoc.
+          int fileSpecId = ((Number) specIdAccessor.get(row)).intValue();
+          if (fileSpecId != currentSpecId) {
+            return;
+          }
+          String path = pathAccessor.get(row).toString();
+          long size = ((Number) sizeAccessor.get(row)).longValue();
+          @SuppressWarnings("unchecked")
+          Map<Integer, ByteBuffer> lowerBounds = (Map<Integer, ByteBuffer>) lowerBoundsAccessor.get(row);
+          ByteBuffer bound = lowerBounds == null ? null : lowerBounds.get(orderingFieldId);
+          if (bound == null) {
+            missingStats.set(true);
+            return;
+          }
+          files.add(new FileInfo(path, size, extractOrderKey(bound)));
+        });
+
+    if (missingStats.get()) {
       LOG.warn(
           "Skipping partition {}: at least one data file has no recorded lower bound for ordering "
               + "column '{}', so file ordering cannot be determined safely",
@@ -872,11 +955,12 @@ public final class IcebergPartitionCompactor {
         // Parquet-specific class - on its compile classpath at all: the factory looks up the
         // registered Parquet FormatModel (from iceberg-parquet, needed only at runtime) via
         // FormatModelRegistry internally. See the class Javadoc's dependency note.
+        //
+        // NOTE: GenericFileWriterFactory.builderFor(Table) is not public as shipped in 1.11.0
+        // (only the Builder class and its constructor are) - construct the Builder directly
+        // rather than going through that static factory method.
         FileWriterFactory<Record> writerFactory =
-            new GenericFileWriterFactory.Builder(table)
-                .dataSchema(table.schema())
-                .dataFileFormat(FileFormat.PARQUET)
-                .build();
+            new GenericFileWriterFactory.Builder(table).dataSchema(table.schema()).dataFileFormat(FileFormat.PARQUET).build();
         DataWriter<Record> writer = writerFactory.newDataWriter(encryptedOutputFile, table.spec(), outputPartition);
         try {
           for (FileScanTask t : tasks) {
