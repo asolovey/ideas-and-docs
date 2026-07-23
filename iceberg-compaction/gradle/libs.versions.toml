@@ -3,6 +3,7 @@ iceberg = "1.11.0"
 slf4j = "2.0.17"
 logback = "1.5.18"
 junit = "5.14.2"
+hadoop = "3.4.3"
 
 [libraries]
 # Iceberg API/implementation. iceberg-core pulls in iceberg-api transitively.
@@ -18,6 +19,15 @@ logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "lo
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+
+# iceberg-parquet's Parquet writer/reader internals reach for org.apache.hadoop.conf.Configuration
+# even when no Hadoop catalog/FileIO is in use (https://github.com/apache/iceberg/issues/10180,
+# closed as not planned) - iceberg-parquet does not pull this in transitively, so it must be
+# declared explicitly. hadoop-client-api/-runtime is the modern, much lighter substitute for the
+# legacy hadoop-common (which drags in an old, potentially conflicting transitive dependency
+# tree); version pinned to what Iceberg 1.11.0 itself tests against.
+hadoop-client-api = { module = "org.apache.hadoop:hadoop-client-api", version.ref = "hadoop" }
+hadoop-client-runtime = { module = "org.apache.hadoop:hadoop-client-runtime", version.ref = "hadoop" }
 
 [bundles]
 iceberg = ["iceberg-core", "iceberg-data"]

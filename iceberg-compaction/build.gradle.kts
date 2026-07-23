@@ -25,6 +25,14 @@ dependencies {
     // org.apache.parquet.* directly - see IcebergPartitionCompactor's class Javadoc.
     runtimeOnly(libs.iceberg.parquet)
 
+    // iceberg-parquet's writer/reader internals load org.apache.hadoop.conf.Configuration even
+    // without a Hadoop catalog/FileIO in use, and iceberg-parquet does not pull it in
+    // transitively (github.com/apache/iceberg/issues/10180). Runtime-only, and the lighter
+    // hadoop-client-api/-runtime pair rather than the legacy hadoop-common, which drags in an
+    // older, potentially conflicting transitive dependency tree (e.g. Jackson).
+    runtimeOnly(libs.hadoop.client.api)
+    runtimeOnly(libs.hadoop.client.runtime)
+
     // Logging: slf4j API at compile time, logback as the runtime backend.
     implementation(libs.slf4j.api)
     runtimeOnly(libs.logback.classic)

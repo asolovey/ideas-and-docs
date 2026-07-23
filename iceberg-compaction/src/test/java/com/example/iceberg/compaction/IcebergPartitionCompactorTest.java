@@ -31,6 +31,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.GenericFileWriterFactory;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
+import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
@@ -395,8 +396,9 @@ class IcebergPartitionCompactorTest {
   }
 
   private DataFile writeDataFile(Table table, List<Record> rows) throws IOException {
+    var recordWrapper = new InternalRecordWrapper(table.schema().asStruct());
     PartitionKey pk = new PartitionKey(table.spec(), table.schema());
-    pk.partition(rows.get(0));
+    pk.partition(recordWrapper.wrap(rows.get(0)));
 
     OutputFileFactory outFactory =
         OutputFileFactory.builderFor(table, 0, fileSeq.incrementAndGet()).format(FileFormat.PARQUET).build();
@@ -406,7 +408,7 @@ class IcebergPartitionCompactorTest {
     // org.apache.parquet.schema.MessageType on the compile classpath - see the main class's
     // Javadoc for why.
     FileWriterFactory<Record> writerFactory =
-        GenericFileWriterFactory.builderFor(table).dataSchema(table.schema()).dataFileFormat(FileFormat.PARQUET).build();
+        new GenericFileWriterFactory.Builder(table).dataSchema(table.schema()).dataFileFormat(FileFormat.PARQUET).build();
     DataWriter<Record> writer = writerFactory.newDataWriter(out, table.spec(), pk);
     try {
       for (Record r : rows) {
@@ -425,7 +427,7 @@ class IcebergPartitionCompactorTest {
     EncryptedOutputFile out = outFactory.newOutputFile(table.spec(), pk);
 
     FileWriterFactory<Record> writerFactory =
-        GenericFileWriterFactory.builderFor(table)
+        new GenericFileWriterFactory.Builder(table)
             .dataSchema(table.schema())
             .dataFileFormat(FileFormat.PARQUET)
             .deleteFileFormat(FileFormat.PARQUET)
