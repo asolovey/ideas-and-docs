@@ -24,6 +24,8 @@ dependencies {
     // class deliberately never imports anything from org.apache.iceberg.parquet or
     // org.apache.parquet.* directly - see IcebergPartitionCompactor's class Javadoc.
     runtimeOnly(libs.iceberg.parquet)
+    runtimeOnly(libs.iceberg.orc)
+
 
     // iceberg-parquet's writer/reader internals load org.apache.hadoop.conf.Configuration even
     // without a Hadoop catalog/FileIO in use, and iceberg-parquet does not pull it in

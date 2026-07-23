@@ -310,8 +310,9 @@ class IcebergPartitionCompactorTest {
 
     // Delete row id=0, which lives at position 0 of files.get(0).
     DataFile targeted = files.get(0);
+    InternalRecordWrapper recordWrapper = new InternalRecordWrapper(table.schema().asStruct());
     PartitionKey pk = new PartitionKey(table.spec(), table.schema());
-    pk.partition(row(0, date.atTime(9, 0), date, 2, "us"));
+    pk.partition(recordWrapper.wrap(row(0, date.atTime(9, 0), date, 2, "us")));
     DeleteFile deleteFile = writePositionDeleteFile(table, pk, targeted.location(), 0L);
     table.newRowDelta().addDeletes(deleteFile).commit();
 

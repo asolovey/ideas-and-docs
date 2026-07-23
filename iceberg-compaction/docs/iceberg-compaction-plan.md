@@ -477,12 +477,23 @@ through `GenericFileWriterFactory`/`FormatModelRegistry`, and no Parquet-specifi
 appears in the signature of anything this code calls, so nothing needs to compile against it:
 
 ```java
-FileWriterFactory<Record> writerFactory = GenericFileWriterFactory.builderFor(table)
+FileWriterFactory<Record> writerFactory = new GenericFileWriterFactory.Builder(table)
     .dataSchema(table.schema())
     .dataFileFormat(FileFormat.PARQUET)
     .build();
 DataWriter<Record> writer = writerFactory.newDataWriter(encryptedOutputFile, table.spec(), outputPartition);
+```
 
+(`GenericFileWriterFactory.builderFor(Table)` — the entry point shown in some in-development
+Iceberg PR examples predating 1.11.0's actual release — is **not public** as shipped; only the
+`Builder` class and its `Builder(Table)` constructor are. Construct `Builder` directly, as above.
+This is exactly the kind of pre-release-example-vs.-shipped-reality drift §13 warns about
+generally, caught here by an actual `error: builderFor(Table) is not public in
+GenericFileWriterFactory` from a real build — a good reminder that even a concrete code example
+found during research can reflect a snapshot that changed before release, and a real compiler is
+the only fully reliable check.)
+
+```java
 for (FileScanTask task : tasks) { // in the same time-sorted order the job was planned in
   GenericDeleteFilter deleteFilter =
       new GenericDeleteFilter(table.io(), task, table.schema(), table.schema());
@@ -698,11 +709,30 @@ deterministically:
 - **`PartitionKey`** (`org.apache.iceberg.PartitionKey`, `new PartitionKey(spec, schema)` then
   `.partition(someRow)`) computes a correct partition tuple from a representative row by actually
   applying the spec's transforms — this is the right way to get a `StructLike` to write test data
-  into, and avoids hand-computing a `day` transform's value.
+  into, and avoids hand-computing a `day` transform's value. **It needs that row's values in
+  Iceberg's internal representation, not the generic one `GenericRecord`/`Record` normally use** —
+  passing a `GenericRecord` straight to `.partition(...)` fails at runtime with something like
+  `IllegalStateException: Not an instance of java.lang.Integer: 2026-07-10` (a `date` field, set
+  via `setField` as a `LocalDate`, being read back by transform/accessor code that expects the
+  internal `Integer` epoch-day form; the same happens for `timestamp` fields, expected as `Long`
+  epoch-micros rather than `LocalDateTime`). Wrap the row first:
+  ```java
+  InternalRecordWrapper wrapper = new InternalRecordWrapper(schema.asStruct());
+  PartitionKey pk = new PartitionKey(spec, schema);
+  pk.partition(wrapper.wrap(someRow));
+  ```
+  `InternalRecordWrapper` (`org.apache.iceberg.data`) is exactly the sanctioned bridge between the
+  two representations - the generic one that reading/writing `Record`s uses everywhere else in
+  this plan, and the internal one that transform/accessor machinery like `PartitionKey` needs.
+  This only came up in testing because the compactor itself never constructs a `PartitionKey` from
+  a hand-built `Record` - it only ever reads generic values back out of already-internal
+  `StructLike`s (metadata table partition structs, real `DataFile.partition()`), so there's no
+  representation mismatch anywhere in §5-§10's own code, only in test helpers that fabricate rows.
 - **Writing data and position-delete files for tests** goes through the same
   `GenericFileWriterFactory` as the compactor itself (§10.2) rather than `Parquet.writeData`/
-  `Parquet.writeDeletes` directly, for the same reason: `GenericFileWriterFactory.builderFor(table)
-  .dataSchema(schema).dataFileFormat(FileFormat.PARQUET).deleteFileFormat(FileFormat.PARQUET)
+  `Parquet.writeDeletes` directly, for the same reason, and with the same `new
+  GenericFileWriterFactory.Builder(table)` construction (not the non-public `builderFor`):
+  `.dataSchema(schema).dataFileFormat(FileFormat.PARQUET).deleteFileFormat(FileFormat.PARQUET)
   .build()` gives a `FileWriterFactory<Record>` whose `newDataWriter(encryptedOutputFile, spec,
   partitionKey)` and `newPositionDeleteWriter(encryptedOutputFile, spec, partitionKey)` cover both
   cases without a test helper ever importing anything Parquet-specific either. For the position

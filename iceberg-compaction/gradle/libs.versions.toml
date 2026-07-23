@@ -12,6 +12,7 @@ iceberg-core = { module = "org.apache.iceberg:iceberg-core", version.ref = "iceb
 iceberg-data = { module = "org.apache.iceberg:iceberg-data", version.ref = "iceberg" }
 # Parquet read/write support (org.apache.iceberg.data.parquet.*, org.apache.iceberg.parquet.Parquet).
 iceberg-parquet = { module = "org.apache.iceberg:iceberg-parquet", version.ref = "iceberg" }
+iceberg-orc = { module = "org.apache.iceberg:iceberg-orc", version.ref = "iceberg" }
 
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
