@@ -44,6 +44,7 @@ import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileWriterFactory;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.DateTimeUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -233,8 +234,8 @@ class IcebergPartitionCompactorTest {
     List<IcebergPartitionCompactor.CompactionJob> jobs = compactor.plan();
     assertEquals(2, jobs.size(), "one job per date");
 
-    int newerIndex = indexOfJobMentioning(jobs, newer.toString());
-    int olderIndex = indexOfJobMentioning(jobs, older.toString());
+    int newerIndex = indexOfJobMentioning(jobs, "event_date=" + DateTimeUtil.daysFromDate(newer));
+    int olderIndex = indexOfJobMentioning(jobs, "event_date=" + DateTimeUtil.daysFromDate(older));
     assertTrue(newerIndex >= 0 && olderIndex >= 0);
     assertTrue(newerIndex < olderIndex, "the more recent date's job should come first");
   }

@@ -53,6 +53,7 @@ import org.apache.iceberg.transforms.Transform;
 import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,9 +92,9 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li>Only partitions written under the table's <em>current</em> partition spec are
  *       considered; data under a historical, evolved-away spec id is left alone. This is
- *       enforced twice: once when discovering candidate partitions (§ {@code spec_id} on the
+ *       enforced twice: once when discovering candidate partitions ({@code spec_id} on the
  *       {@code PARTITIONS} table) and again, per file, immediately before it would be rewritten
- *       (§ {@code spec_id} on the {@code FILES} table and on each freshly-scanned {@link
+ *       ({@code spec_id} on the {@code FILES} table and on each freshly-scanned {@link
  *       DataFile}) - the second check is what protects against the spec changing between
  *       planning and a job actually running.
  *   <li>Reading and writing goes through Iceberg's format registry ({@link
@@ -489,7 +490,8 @@ public final class IcebergPartitionCompactor {
     Map<String, Object> values = new LinkedHashMap<>();
     List<Types.NestedField> fields = unionType.fields();
     for (int i = 0; i < fields.size(); i++) {
-      values.put(fields.get(i).name(), partition.get(i, Object.class));
+      Types.NestedField field = fields.get(i);
+      values.put(field.name(), partition.get(i, Object.class));
     }
     return values;
   }
@@ -509,6 +511,18 @@ public final class IcebergPartitionCompactor {
   // ---------------------------------------------------------------------------------------
   // Stage 2: inventory a candidate partition's data files via the FILES metadata table.
   // ---------------------------------------------------------------------------------------
+  private static boolean matchesPartition(StructLike filePartition, Map<String, Object> candidateValues, Types.StructType unionType) {
+    List<Types.NestedField> fields = unionType.fields();
+    for (int i = 0; i < fields.size(); i++) {
+      Types.NestedField field = fields.get(i);
+      Object candVal = candidateValues.get(field.name());
+      Object fileVal = filePartition.get(i, Object.class);
+      if (!Objects.equals(candVal, fileVal)) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   private List<FileInfo> inventoryFiles(PartitionCandidate candidate, PartitionSpec spec) {
     Table filesTable = MetadataTableUtils.createMetadataTableInstance(table, MetadataTableType.FILES);
@@ -520,6 +534,10 @@ public final class IcebergPartitionCompactor {
     Accessor<StructLike> sizeAccessor = accessorFor(metaSchema, "file_size_in_bytes");
     Accessor<StructLike> lowerBoundsAccessor = accessorFor(metaSchema, "lower_bounds");
     Accessor<StructLike> specIdAccessor = accessorFor(metaSchema, "spec_id");
+
+    // partition accessor and type lookup
+    Accessor<StructLike> partitionAccessor = accessorFor(metaSchema, "partition");
+    Types.StructType unionType = Partitioning.partitionType(table);
 
     List<FileInfo> files = new ArrayList<>();
     AtomicBoolean missingStats = new AtomicBoolean(false);
@@ -541,6 +559,13 @@ public final class IcebergPartitionCompactor {
           if (fileSpecId != currentSpecId) {
             return;
           }
+
+          // manual row-level partition filtering
+          StructLike filePartition = (StructLike) partitionAccessor.get(row);
+          if (!matchesPartition(filePartition, candidate.partitionValues, unionType)) {
+            return;
+          }
+
           String path = pathAccessor.get(row).toString();
           long size = ((Number) sizeAccessor.get(row)).longValue();
           @SuppressWarnings("unchecked")
