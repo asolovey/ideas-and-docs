@@ -18,6 +18,7 @@ import java.util.function.Consumer;
 
 import org.apache.iceberg.Accessor;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataTask;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -34,7 +35,6 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericDeleteFilter;
 import org.apache.iceberg.data.GenericFileWriterFactory;
-import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.CommitFailedException;
@@ -414,9 +414,16 @@ public final class IcebergPartitionCompactor {
    * format registry used for real data files (see the class Javadoc's dependency note) and fails
    * with {@code IllegalArgumentException: Format model is not registered for format METADATA}
    * for exactly this reason.
+   *
+   * <p>Deliberately does not project columns via {@code .select(...)}: the {@link Accessor}s
+   * callers use to read fields out of each row are resolved from the metadata table's full,
+   * unprojected {@link Table#schema()}, and a projected scan reshapes rows to match a narrower
+   * schema - reading them through accessors bound to field positions in the *unprojected* schema
+   * then fails with an out-of-bounds error. Metadata tables are cheap enough (bounded by a
+   * table's partition/file count, not its row count) that this isn't worth the complexity of
+   * re-deriving accessors from the scan's own projected schema instead.
    */
-  private static void scanMetadataRows(
-      Table metadataTable, Expression filter, Consumer<StructLike> rowConsumer) {
+  private static void scanMetadataRows(Table metadataTable, Expression filter, Consumer<StructLike> rowConsumer) {
     try (CloseableIterable<FileScanTask> tasks = metadataTable.newScan().filter(filter).planFiles()) {
       for (FileScanTask task : tasks) {
         if (!task.isDataTask()) {
@@ -799,6 +806,17 @@ public final class IcebergPartitionCompactor {
       this.startingSnapshotId = startingSnapshotId;
       this.shardColumnName = shardColumnName;
       this.shardValue = shardValue;
+    }
+
+    @Override
+    public String toString() {
+      return "CompactionJob{partition="
+          + partitionValues
+          + ", files="
+          + jobFiles.size()
+          + ", startingSnapshotId="
+          + startingSnapshotId
+          + "}";
     }
 
     @Override

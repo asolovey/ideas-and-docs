@@ -10,6 +10,7 @@ import java.io.UncheckedIOException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +22,7 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RewriteFiles;
@@ -185,6 +187,19 @@ class IcebergPartitionCompactorTest {
     assertEquals(2, jobs.size());
     jobs.forEach(Runnable::run);
 
+    // Check grouping directly via each *file's* own declared partition and record count, not by
+    // reading rows back and checking their own id/region fields: a row's own field values survive
+    // a merge unchanged regardless of which file it lands in, so that check would still pass even
+    // if us and eu had wrongly been merged into one file - it doesn't actually exercise grouping.
+    // A file wrongly combining both regions would show up here as an unexpected partition value
+    // or a record count other than 6.
+    Map<String, Long> recordCountByRegion = recordCountByRegionPartition(table);
+    assertEquals(Set.of("us", "eu"), recordCountByRegion.keySet());
+    assertEquals(6L, recordCountByRegion.get("us"), "all 6 'us' rows should live in 'us'-partitioned file(s)");
+    assertEquals(6L, recordCountByRegion.get("eu"), "all 6 'eu' rows should live in 'eu'-partitioned file(s)");
+
+    // The rows themselves should still be exactly as expected too.
+    assertEquals(12, liveIds(table).size());
     for (Record r : readAll(table)) {
       String region = r.getField("region").toString();
       long rowId = (Long) r.getField("id");
@@ -310,9 +325,7 @@ class IcebergPartitionCompactorTest {
 
     // Delete row id=0, which lives at position 0 of files.get(0).
     DataFile targeted = files.get(0);
-    InternalRecordWrapper recordWrapper = new InternalRecordWrapper(table.schema().asStruct());
-    PartitionKey pk = new PartitionKey(table.spec(), table.schema());
-    pk.partition(recordWrapper.wrap(row(0, date.atTime(9, 0), date, 2, "us")));
+    PartitionKey pk = partitionKeyFor(table, row(0, date.atTime(9, 0), date, 2, "us"));
     DeleteFile deleteFile = writePositionDeleteFile(table, pk, targeted.location(), 0L);
     table.newRowDelta().addDeletes(deleteFile).commit();
 
@@ -396,10 +409,27 @@ class IcebergPartitionCompactorTest {
     return r;
   }
 
-  private DataFile writeDataFile(Table table, List<Record> rows) throws IOException {
-    var recordWrapper = new InternalRecordWrapper(table.schema().asStruct());
+  /**
+   * Computes a {@link PartitionKey} for a representative row.
+   *
+   * <p>{@code PartitionKey.partition(StructLike)} applies the spec's transforms using Iceberg's
+   * internal Java representation (e.g. an {@code Integer} epoch-day for a {@code date}, a {@code
+   * Long} epoch-microsecond for a {@code timestamp}) - not the "generic" representation ({@code
+   * LocalDate}, {@code LocalDateTime}, ...) that {@link GenericRecord#setField} was used to
+   * populate {@code row} with. Passing a plain {@code GenericRecord} straight to {@code
+   * partition(...)} fails with e.g. {@code IllegalStateException: Not an instance of
+   * java.lang.Integer: 2026-07-10}. {@link InternalRecordWrapper} is the sanctioned bridge
+   * between the two representations.
+   */
+  private static PartitionKey partitionKeyFor(Table table, Record row) {
+    InternalRecordWrapper wrapper = new InternalRecordWrapper(table.schema().asStruct());
     PartitionKey pk = new PartitionKey(table.spec(), table.schema());
-    pk.partition(recordWrapper.wrap(rows.get(0)));
+    pk.partition(wrapper.wrap(row));
+    return pk;
+  }
+
+  private DataFile writeDataFile(Table table, List<Record> rows) throws IOException {
+    PartitionKey pk = partitionKeyFor(table, rows.get(0));
 
     OutputFileFactory outFactory =
         OutputFileFactory.builderFor(table, 0, fileSeq.incrementAndGet()).format(FileFormat.PARQUET).build();
@@ -407,7 +437,8 @@ class IcebergPartitionCompactorTest {
 
     // GenericFileWriterFactory (rather than Parquet.writeData(...) directly) avoids needing
     // org.apache.parquet.schema.MessageType on the compile classpath - see the main class's
-    // Javadoc for why.
+    // Javadoc. builderFor(Table) isn't public as shipped in 1.11.0, so the Builder is
+    // constructed directly.
     FileWriterFactory<Record> writerFactory =
         new GenericFileWriterFactory.Builder(table).dataSchema(table.schema()).dataFileFormat(FileFormat.PARQUET).build();
     DataWriter<Record> writer = writerFactory.newDataWriter(out, table.spec(), pk);
@@ -452,6 +483,35 @@ class IcebergPartitionCompactorTest {
       append.appendFile(f);
     }
     append.commit();
+  }
+
+  /**
+   * Sums each output data file's record count, grouped by that file's own declared value for the
+   * "region" partition field - used to verify grouping actually happened at the file level (see
+   * {@link #keepsOtherPartitionColumnsSeparate}), rather than trusting that individual rows'
+   * fields look right, which they would regardless of whether files were grouped correctly.
+   */
+  private static Map<String, Long> recordCountByRegionPartition(Table table) throws IOException {
+    int regionPos = -1;
+    List<PartitionField> specFields = table.spec().fields();
+    for (int i = 0; i < specFields.size(); i++) {
+      if (specFields.get(i).name().equals("region")) {
+        regionPos = i;
+        break;
+      }
+    }
+    if (regionPos < 0) {
+      throw new IllegalStateException("'region' is not a partition field of " + table.spec());
+    }
+
+    Map<String, Long> counts = new HashMap<>();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        String region = task.file().partition().get(regionPos, Object.class).toString();
+        counts.merge(region, task.file().recordCount(), Long::sum);
+      }
+    }
+    return counts;
   }
 
   private static int countDataFiles(Table table) throws IOException {
